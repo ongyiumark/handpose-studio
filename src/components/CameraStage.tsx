@@ -550,14 +550,10 @@ export default function CameraStage({
               (pts: any[], idx: number) => {
                 const handInfo = handednessList[idx]?.[0];
                 const rawHandedness = handInfo?.categoryName || "Right";
-                // MediaPipe assumes an unmirrored camera feed; invert handedness in mirrored selfie mode so physical Right hand reads "Right"
-                const handedness: "Left" | "Right" = mirrored
-                  ? rawHandedness === "Left"
-                    ? "Right"
-                    : "Left"
-                  : rawHandedness === "Left"
-                  ? "Left"
-                  : "Right";
+                // MediaPipe HandLandmarker returns handedness from the subject's perspective for the camera feed.
+                // Keep handedness consistent so physical Left/Right labels are never swapped when display mirroring is toggled.
+                const handedness: "Left" | "Right" =
+                  rawHandedness === "Left" ? "Left" : "Right";
                 const score = handInfo?.score ?? 0.85;
                 const worldPts = result.worldLandmarks?.[idx] || pts;
 
