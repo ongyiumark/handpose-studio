@@ -191,7 +191,7 @@ export async function loadWorkspaceLocally(): Promise<PersistedWorkspace | null>
       };
     });
 
-    if (active && (active.classes?.length > 0 || active.samples?.length > 0)) {
+    if (active && Array.isArray(active.classes)) {
       return active;
     }
 

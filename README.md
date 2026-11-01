@@ -20,14 +20,14 @@ An interactive 3D hand-pose dataset builder, in-browser neural network trainer, 
   - **Auto-Burst Recording** (captures 10–25 frames automatically while holding a pose)
   - **One-Click Demo Dataset** (32 synthetic 3D hand pose samples across 4 classes for instant testing without a webcam)
 - **In-Browser Machine Learning (`@tensorflow/tfjs`)**:
-  - **TF.js Multi-Layer Perceptron (MLP)**: Trains a 3-layer neural network on translation- and scale-invariant 63-D wrist-centered landmark vectors with 5x 3D rotation/jitter augmentation and live SVG Loss & Accuracy curves.
+  - **TF.js Multi-Layer Perceptron (MLP)**: Trains a 3-layer neural network on translation- and scale-invariant 131-D wrist-centered landmark vectors (supporting both 1-hand and 2-hand poses) with 5x 3D rotation/jitter augmentation and live SVG Loss, Train Accuracy, & Holdout Validation Accuracy curves.
   - **Instant k-NN Classifier**: Zero-wait distance-weighted Nearest Neighbors classifier with Leave-One-Out accuracy evaluation.
   - **Live Webcam Prediction HUD**: Real-time hand pose prediction banner with animated per-class confidence bars.
 - **100% Browser Local Storage & Rich Exports**:
   - **Zero Server Storage / Complete Privacy**: All classes, captured photos, 3D landmarks, and trained models are stored strictly in the user's browser (`localStorage` + browser `IndexedDB`). Nothing is ever uploaded to a server.
   - **Export Formats**:
     - **Full Dataset Archive (`.zip`)**: Class folders with `.jpeg` frames, `.json` annotations (both MediaPipe and legacy `@tensorflow-models/handpose` format), `landmarks.csv`, and `dataset-manifest.json`.
-    - **Landmarks Feature Table (`.csv`)**: Flat tabular CSV with raw & normalized 63-D coordinates ready for Python, `scikit-learn`, or PyTorch.
+    - **Landmarks Feature Table (`.csv`)**: Flat tabular CSV with raw & normalized 131-D 1-hand & 2-hand coordinates ready for Python, `scikit-learn`, or PyTorch.
     - **Trained TF.js Model Bundle (`.zip`)**: Exports `model.json`, `model.weights.bin`, `classes.json`, and a ready-to-run `inference-example.js`.
     - **Workspace Backup (`.json`)**: Lossless JSON export & import.
 

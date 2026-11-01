@@ -1,4 +1,3 @@
-import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import * as Sentry from "@sentry/nextjs";
 import {
@@ -45,11 +44,11 @@ export function buildLandmarksCsvString(samples: CapturedSample[]): string {
   const rows: string[] = [headerCols.join(",")];
 
   const sanitizeCsvField = (val: string): string => {
-    let clean = val.replace(/"/g, '""');
-    if (/^[=+@-]/i.test(clean)) {
-      clean = `'${clean}`;
-    }
-    return `"${clean}"`;
+    const normalized = val.replace(/[\r\n]+/g, " ").trim();
+    const prefixSafe = /^[\s"']*[\t=+@-]/.test(normalized)
+      ? `'${normalized}`
+      : normalized;
+    return `"${prefixSafe.replace(/"/g, '""')}"`;
   };
 
   for (const sample of samples) {
@@ -106,19 +105,44 @@ export async function exportDatasetZip(
       attributes: {
         samples_count: samples.length,
         classes_count: classes.length,
-        dataset_name: datasetName,
       },
     },
     async () => {
+      const { default: JSZip } = await import("jszip");
       const zip = new JSZip();
       const safeRoot =
-        datasetName.trim().replace(/[^a-zA-Z0-9_-]/g, "-") || "handpose-dataset";
+        datasetName
+          .trim()
+          .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+          .replace(/^-+|-+$/g, "") || "handpose-dataset";
       const root = zip.folder(safeRoot);
       if (!root) return;
 
+      // Disambiguate class folder names when distinct class names sanitize to the same slug
+      const classFolderMap = new Map<string, string>();
+      const usedFolderSlugs = new Set<string>();
+      const getSafeClassFolder = (rawClassName: string): string => {
+        const key = rawClassName.trim();
+        const existing = classFolderMap.get(key);
+        if (existing) return existing;
+
+        const baseSlug =
+          key
+            .replace(/[^\p{L}\p{N}_-]+/gu, "_")
+            .replace(/^_+|_+$/g, "") || "unlabeled";
+        let slug = baseSlug;
+        let suffix = 2;
+        while (usedFolderSlugs.has(slug.toLowerCase())) {
+          slug = `${baseSlug}_${suffix}`;
+          suffix++;
+        }
+        usedFolderSlugs.add(slug.toLowerCase());
+        classFolderMap.set(key, slug);
+        return slug;
+      };
+
       for (const [idx, sample] of samples.entries()) {
-        const safeClass =
-          sample.className.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "unlabeled";
+        const safeClass = getSafeClassFolder(sample.className);
         const classFolder = root.folder(safeClass);
         if (!classFolder) continue;
 
@@ -215,45 +239,59 @@ export function parseImportedDatasetJson(jsonText: string): {
   try {
     parsed = JSON.parse(jsonText);
   } catch {
-    throw new Error("Invalid JSON: Failed to parse file.");
+    throw new Error(
+      "Could not read this file. Please select a valid .json workspace backup exported from Hand Pose Studio."
+    );
   }
   if (!parsed || typeof parsed !== "object") {
-    throw new Error("Invalid dataset: Root must be a JSON object.");
+    throw new Error(
+      "This file doesn't appear to be a Hand Pose Studio workspace backup."
+    );
   }
   const raw = parsed as Record<string, unknown>;
   if (!Array.isArray(raw.samples)) {
-    throw new Error("Invalid dataset JSON: missing 'samples' array.");
+    throw new Error(
+      "This JSON file is missing a 'samples' list. Make sure you're importing a Workspace Backup (.json), not a single landmark annotation file."
+    );
   }
+
+  const clampFinite = (val: unknown, fallback: number, min: number, max: number): number =>
+    typeof val === "number" && Number.isFinite(val)
+      ? Math.min(max, Math.max(min, val))
+      : fallback;
 
   // Validate each sample and its 21 landmarks
   const validSamples: CapturedSample[] = [];
+  const seenSampleIds = new Set<string>();
+
   for (let i = 0; i < raw.samples.length; i++) {
     const s = raw.samples[i];
     if (!s || typeof s !== "object") continue;
-    const className = typeof s.className === "string" ? s.className.trim() : "";
+    const className =
+      typeof s.className === "string" ? s.className.trim().slice(0, 64) : "";
     if (!className || !Array.isArray(s.hands) || s.hands.length === 0) continue;
 
     const validHands = s.hands
       .filter((h: unknown) => h && typeof h === "object")
       .map((h: Record<string, unknown>) => {
         const handedness = h.handedness === "Left" ? "Left" : "Right";
-        const score = typeof h.score === "number" && !isNaN(h.score) ? h.score : 0.9;
+        const score = clampFinite(h.score, 0.9, 0, 1);
         const landmarks = Array.isArray(h.landmarks)
           ? h.landmarks
               .filter((lm: unknown) => lm && typeof lm === "object")
               .map((lm: Record<string, unknown>) => ({
-                x: typeof lm.x === "number" && !isNaN(lm.x) ? lm.x : 0,
-                y: typeof lm.y === "number" && !isNaN(lm.y) ? lm.y : 0,
-                z: typeof lm.z === "number" && !isNaN(lm.z) ? lm.z : 0,
+                x: clampFinite(lm.x, 0, -10, 10),
+                y: clampFinite(lm.y, 0, -10, 10),
+                z: clampFinite(lm.z, 0, -10, 10),
               }))
           : [];
         const worldLandmarks = Array.isArray(h.worldLandmarks)
           ? h.worldLandmarks
               .filter((lm: unknown) => lm && typeof lm === "object")
               .map((lm: Record<string, unknown>) => ({
-                x: typeof lm.x === "number" && !isNaN(lm.x) ? lm.x : 0,
-                y: typeof lm.y === "number" && !isNaN(lm.y) ? lm.y : 0,
-                z: typeof lm.z === "number" && !isNaN(lm.z) ? lm.z : 0,
+                x: clampFinite(lm.x, 0, -10, 10),
+                y: clampFinite(lm.y, 0, -10, 10),
+                z: clampFinite(lm.z, 0, -10, 10),
               }))
           : landmarks.map((p) => ({
               x: (p.x - 0.5) * 0.2,
@@ -270,19 +308,36 @@ export function parseImportedDatasetJson(jsonText: string): {
     const isSafeDataUrl = /^data:image\/(jpe?g|png|webp);base64,[A-Za-z0-9+/=\s\-_]+$/i.test(rawDataUrl);
     const imageDataUrl = isSafeDataUrl ? rawDataUrl : "";
 
+    const baseId =
+      typeof s.id === "string" && s.id.trim()
+        ? s.id.trim().slice(0, 80)
+        : `sample_${Date.now()}_${i}`;
+    let uniqueId = baseId;
+    let idSuffix = 2;
+    while (seenSampleIds.has(uniqueId)) {
+      uniqueId = `${baseId}_${idSuffix}`;
+      idSuffix++;
+    }
+    seenSampleIds.add(uniqueId);
+
     validSamples.push({
-      id: typeof s.id === "string" && s.id ? s.id : `sample_${Date.now()}_${i}`,
+      id: uniqueId,
       className,
-      timestamp: typeof s.timestamp === "number" ? s.timestamp : Date.now(),
+      timestamp:
+        typeof s.timestamp === "number" && Number.isFinite(s.timestamp)
+          ? s.timestamp
+          : Date.now(),
       imageDataUrl,
       hands: validHands,
-      width: typeof s.width === "number" ? s.width : 640,
-      height: typeof s.height === "number" ? s.height : 480,
+      width: Math.round(clampFinite(s.width, 640, 64, 1920)),
+      height: Math.round(clampFinite(s.height, 480, 64, 1920)),
     });
   }
 
   if (validSamples.length === 0 && raw.samples.length > 0) {
-    throw new Error("Invalid dataset: No samples contained valid 21-point hand landmark data.");
+    throw new Error(
+      "No valid 21-point hand pose samples were found in this file."
+    );
   }
 
   // Validate classes and auto-reconstruct any missing classes found in samples
@@ -292,16 +347,27 @@ export function parseImportedDatasetJson(jsonText: string): {
 
   for (const c of rawClasses) {
     if (c && typeof c === "object" && typeof c.name === "string" && c.name.trim()) {
-      const name = c.name.trim();
+      const name = c.name.trim().slice(0, 64);
       if (!knownClassNames.has(name.toLowerCase())) {
         knownClassNames.add(name.toLowerCase());
+        const isSafeHexColor =
+          typeof c.color === "string" && /^#[0-9a-fA-F]{3,8}$/.test(c.color.trim());
         validClasses.push({
           name,
-          color: typeof c.color === "string" && c.color ? c.color : getClassColor(validClasses.length),
-          createdAt: typeof c.createdAt === "number" ? c.createdAt : Date.now(),
+          color: isSafeHexColor ? c.color.trim() : getClassColor(validClasses.length),
+          createdAt:
+            typeof c.createdAt === "number" && Number.isFinite(c.createdAt)
+              ? c.createdAt
+              : Date.now(),
         });
       }
     }
+  }
+
+  if (validSamples.length === 0 && validClasses.length === 0) {
+    throw new Error(
+      "This workspace backup is empty (0 classes and 0 pose samples)."
+    );
   }
 
   for (const s of validSamples) {
@@ -358,6 +424,7 @@ export async function exportTrainedModelZip(record: TrainedModelRecord) {
         throw new Error("No serialized TensorFlow.js weights available for export.");
       }
 
+      const { default: JSZip } = await import("jszip");
       const zip = new JSZip();
       const { modelTopology, weightSpecs, weightDataBase64 } =
         record.serializedModel;
@@ -400,7 +467,7 @@ export async function exportTrainedModelZip(record: TrainedModelRecord) {
       const exampleCode = `// Example: Loading and running your Hand Pose Studio TF.js model
 import * as tf from '@tensorflow/tfjs';
 
-const CLASSES = ${JSON.stringify(record.classes)};
+const CLASSES = ${JSON.stringify(record.classes).replace(/</g, "\\u003c")};
 const FEATURE_DIM = ${FEATURE_VECTOR_SIZE};
 
 export async function loadPoseClassifier() {

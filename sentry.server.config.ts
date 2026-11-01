@@ -4,16 +4,14 @@
 
 import * as Sentry from "@sentry/nextjs";
 
+const SENTRY_DSN = process.env.NEXT_PUBLIC_SENTRY_DSN;
+
 Sentry.init({
-  dsn: "https://1fea65c54eb54e8a3c14bd7ec727030b@o4507947215749120.ingest.de.sentry.io/4512354541109328",
-
-  // In development, trace 100% of transactions. In production, 20% captures rich performance metrics without hitting quota.
+  dsn: SENTRY_DSN,
+  enabled: Boolean(SENTRY_DSN),
   tracesSampleRate: process.env.NODE_ENV === "production" ? 0.2 : 1.0,
-
   dataCollection: {
-    // To disable sending user data and HTTP bodies, uncomment the lines below. For more info visit:
-    // https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/options/#dataCollection
-    // userInfo: false,
-    // httpBodies: [],
+    userInfo: false,
+    httpBodies: [],
   },
 });

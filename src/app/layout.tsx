@@ -49,7 +49,11 @@ export default function RootLayout({
     <html lang="en" className="dark" suppressHydrationWarning>
       <head>
         <meta name="color-scheme" content="dark" />
-        <link rel="dns-prefetch" href="https://ko-fi.com" />
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `try{var p=JSON.parse(localStorage.getItem("handpose_studio_prefs_v2")||"{}");if(p.hideQuickGuide){document.documentElement.dataset.hideGuide="true";}}catch(e){}`,
+          }}
+        />
       </head>
       <body className="min-h-screen bg-[#0c131d] text-slate-100 selection:bg-terracotta-500/30 selection:text-gold-200">
         {children}

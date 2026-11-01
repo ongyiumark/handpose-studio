@@ -17,6 +17,7 @@ import {
   Settings2,
   Sparkles,
   Square,
+  SwitchCamera,
   Timer,
   X,
   Zap,
@@ -31,9 +32,12 @@ import { drawHandsOnCanvas } from "@/lib/landmarks";
 
 interface CameraStageProps {
   activeClass: PoseClassMeta | null;
+  classes?: PoseClassMeta[];
+  onSelectClass?: (name: string) => void;
   onCaptureSample: (sample: CapturedSample) => void;
   onHandsDetected: (hands: DetectedHand[], fps: number) => void;
   onModelStatusChange: (ready: boolean) => void;
+  onBurstStateChange?: (isBursting: boolean) => void;
   livePrediction: PredictionResult | null;
   classifierActive: boolean;
   isPaused?: boolean;
@@ -41,9 +45,12 @@ interface CameraStageProps {
 
 export default function CameraStage({
   activeClass,
+  classes = [],
+  onSelectClass,
   onCaptureSample,
   onHandsDetected,
   onModelStatusChange,
+  onBurstStateChange,
   livePrediction,
   classifierActive,
   isPaused = false,
@@ -52,6 +59,7 @@ export default function CameraStage({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const activeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoFrameCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const landmarkerRef = useRef<any>(null);
   const rafRef = useRef<number | null>(null);
@@ -68,6 +76,7 @@ export default function CameraStage({
 
   const [cameraOn, setCameraOn] = useState<boolean>(false);
   const [hasStartedOnce, setHasStartedOnce] = useState<boolean>(false);
+  const [facingMode, setFacingMode] = useState<"user" | "environment">("user");
   const [isPortraitStream, setIsPortraitStream] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [mirrored, setMirrored] = useState<boolean>(true);
@@ -75,7 +84,8 @@ export default function CameraStage({
   const [maxHands, setMaxHands] = useState<1 | 2>(2);
   const [minConfidence, setMinConfidence] = useState<number>(0.35);
   const [showSettings, setShowSettings] = useState<boolean>(false);
-  const [showConfidenceTooltip, setShowConfidenceTooltip] = useState<boolean>(false);
+  const [showConfidenceTooltip, setShowConfidenceTooltip] =
+    useState<boolean>(false);
   const confidenceTooltipRef = useRef<HTMLDivElement | null>(null);
 
   // Dismiss confidence tooltip on outside click or Escape key
@@ -124,23 +134,34 @@ export default function CameraStage({
   const [flashEffect, setFlashEffect] = useState<boolean>(false);
   const [captureNotice, setCaptureNotice] = useState<string | null>(null);
 
+  useEffect(() => {
+    onBurstStateChange?.(isBursting);
+  }, [isBursting, onBurstStateChange]);
+
   // Initialize MediaPipe HandLandmarker using CPU XNNPACK (SIMD)
   useEffect(() => {
     let cancelled = false;
+    let idleCallbackId: number | null = null;
+    let fallbackTimerId: number | null = null;
 
-    // Filter out Emscripten stderr info messages that Next.js dev server treats as console errors
-    if (typeof window !== "undefined" && !(window as unknown as { __mpStderrPatched?: boolean }).__mpStderrPatched) {
-      (window as unknown as { __mpStderrPatched?: boolean }).__mpStderrPatched = true;
+    // Filter out benign Emscripten stderr info messages that Next.js dev overlay treats as console errors
+    if (
+      typeof window !== "undefined" &&
+      !(window as unknown as { __mpStderrPatched?: boolean }).__mpStderrPatched
+    ) {
+      (window as unknown as { __mpStderrPatched?: boolean }).__mpStderrPatched =
+        true;
       const originalConsoleError = console.error;
       console.error = (...args: unknown[]) => {
         const text = typeof args[0] === "string" ? args[0] : "";
         if (
-          text.includes("INFO: Created TensorFlow Lite XNNPACK delegate for CPU") ||
+          text.includes(
+            "INFO: Created TensorFlow Lite XNNPACK delegate for CPU"
+          ) ||
           text.startsWith("INFO: ") ||
           text.includes("gl_context.cc") ||
           text.includes("GL version mismatch") ||
-          text.includes("Error querying for GL extensions") ||
-          text.includes("Aborted()")
+          text.includes("Error querying for GL extensions")
         ) {
           console.info(...args);
           return;
@@ -153,6 +174,7 @@ export default function CameraStage({
       try {
         setModelError(null);
         setModelReady(false);
+        onModelStatusChange(false);
         const vision = await import("@mediapipe/tasks-vision");
         const { FilesetResolver, HandLandmarker } = vision;
 
@@ -211,8 +233,6 @@ export default function CameraStage({
               runningMode: "VIDEO",
               numHands: maxHands,
               minHandDetectionConfidence: minConfidence,
-              // Lower presence and tracking thresholds allow MediaPipe to keep tracking both hands
-              // even when they touch, overlap, or partially occlude each other in multi-hand poses.
               minHandPresenceConfidence: Math.max(0.18, minConfidence - 0.15),
               minTrackingConfidence: Math.max(0.18, minConfidence - 0.15),
             });
@@ -230,7 +250,9 @@ export default function CameraStage({
         }
 
         if (!landmarker) {
-          throw lastError ?? new Error("All HandLandmarker init attempts failed");
+          throw (
+            lastError ?? new Error("All HandLandmarker init attempts failed")
+          );
         }
 
         if (cancelled) {
@@ -254,10 +276,35 @@ export default function CameraStage({
       }
     }
 
-    initMediaPipe();
+    // Defer heavy WASM compilation until after initial paint so LCP/INP stay fast
+    if (
+      typeof window !== "undefined" &&
+      typeof window.requestIdleCallback === "function"
+    ) {
+      idleCallbackId = window.requestIdleCallback(
+        () => {
+          if (!cancelled) initMediaPipe();
+        },
+        { timeout: 600 }
+      );
+    } else if (typeof window !== "undefined") {
+      fallbackTimerId = window.setTimeout(() => {
+        if (!cancelled) initMediaPipe();
+      }, 120);
+    }
 
     return () => {
       cancelled = true;
+      if (
+        idleCallbackId !== null &&
+        typeof window !== "undefined" &&
+        typeof window.cancelIdleCallback === "function"
+      ) {
+        window.cancelIdleCallback(idleCallbackId);
+      }
+      if (fallbackTimerId !== null && typeof window !== "undefined") {
+        window.clearTimeout(fallbackTimerId);
+      }
       if (landmarkerRef.current) {
         landmarkerRef.current.close();
         landmarkerRef.current = null;
@@ -267,6 +314,7 @@ export default function CameraStage({
         activeCanvasRef.current = null;
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onModelStatusChange, retryCount]);
 
   // Dynamically update confidence thresholds and max hands without re-instantiating WASM or reloading model
@@ -291,6 +339,14 @@ export default function CameraStage({
     setCameraOn(true);
   }, []);
 
+  const handleSwitchFacingMode = useCallback(() => {
+    setFacingMode((prev) => {
+      const next = prev === "user" ? "environment" : "user";
+      setMirrored(next === "user");
+      return next;
+    });
+  }, []);
+
   // Start / Stop Webcam Stream
   useEffect(() => {
     let activeStream: MediaStream | null = null;
@@ -305,24 +361,36 @@ export default function CameraStage({
         }
         setLiveHands([]);
         latestHandsRef.current = [];
+        fpsTimestampsRef.current = [];
+        setFpsVal(0);
         setCountdown(null);
         setIsBursting(false);
         setBurstCount(0);
         setVideoStatus("Off");
+        onHandsDetectedRef.current([], 0);
         return;
       }
 
       try {
         setCameraError(null);
-        setVideoStatus("Connecting…");
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-            facingMode: "user",
-          },
-          audio: false,
-        });
+        setVideoStatus("Starting camera…");
+        let stream: MediaStream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 480 },
+              facingMode: { ideal: facingMode },
+            },
+            audio: false,
+          });
+        } catch {
+          // Fallback for desktop webcams or browsers that reject facingMode constraints
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+        }
 
         if (!isMounted) {
           stream.getTracks().forEach((t) => t.stop());
@@ -344,7 +412,7 @@ export default function CameraStage({
         console.warn("Webcam access error:", err);
         if (isMounted) {
           setCameraError(
-            "Camera access unavailable or denied. Check browser permissions."
+            "Camera access was blocked or no webcam was found. Please allow camera access in your browser's address bar, or click 'Demo Data' to test without a camera."
           );
           setCameraOn(false);
           setVideoStatus("Off");
@@ -360,9 +428,9 @@ export default function CameraStage({
         activeStream.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [cameraOn]);
+  }, [cameraOn, facingMode]);
 
-  // Pause or resume hardware camera stream tracks & video playback when modal is open
+  // Pause or resume hardware camera stream tracks & video playback when a full modal is open
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !cameraOn) return;
@@ -377,12 +445,17 @@ export default function CameraStage({
         track.enabled = false;
       });
       video.pause();
+      latestHandsRef.current = [];
+      setLiveHands([]);
+      setCountdown(null);
+      setIsBursting(false);
+      setBurstCount(0);
       const canvas = canvasRef.current;
       if (canvas) {
         const ctx = canvas.getContext("2d");
         ctx?.clearRect(0, 0, canvas.width, canvas.height);
       }
-      onHandsDetected([], 0);
+      onHandsDetectedRef.current([], 0);
     } else {
       tracks.forEach((track) => {
         track.enabled = true;
@@ -391,17 +464,19 @@ export default function CameraStage({
         console.warn("Could not auto-resume video playback:", err);
       });
     }
-  }, [isPaused, cameraOn, onHandsDetected]);
+  }, [isPaused, cameraOn]);
 
   // Real-time requestAnimationFrame detection loop
   useEffect(() => {
     let running = true;
 
-    if (!cameraOn) {
-      const canvas = canvasRef.current;
-      if (canvas) {
-        const ctx = canvas.getContext("2d");
-        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    if (!cameraOn || isPaused) {
+      if (!cameraOn) {
+        const canvas = canvasRef.current;
+        if (canvas) {
+          const ctx = canvas.getContext("2d");
+          ctx?.clearRect(0, 0, canvas.width, canvas.height);
+        }
       }
       return () => {
         running = false;
@@ -410,11 +485,6 @@ export default function CameraStage({
 
     const detectFrame = () => {
       if (!running) return;
-
-      if (isPaused) {
-        rafRef.current = requestAnimationFrame(detectFrame);
-        return;
-      }
 
       const video = videoRef.current;
       const canvas = canvasRef.current;
@@ -472,15 +542,22 @@ export default function CameraStage({
             if (!result) return;
 
             const handsList = result.landmarks || [];
-            const handednessList = result.handedness || result.handednesses || [];
+            const handednessList =
+              result.handedness || result.handednesses || [];
 
             const detected: DetectedHand[] = handsList.map(
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               (pts: any[], idx: number) => {
                 const handInfo = handednessList[idx]?.[0];
                 const rawHandedness = handInfo?.categoryName || "Right";
-                const handedness: "Left" | "Right" =
-                  rawHandedness === "Left" ? "Left" : "Right";
+                // MediaPipe assumes an unmirrored camera feed; invert handedness in mirrored selfie mode so physical Right hand reads "Right"
+                const handedness: "Left" | "Right" = mirrored
+                  ? rawHandedness === "Left"
+                    ? "Right"
+                    : "Left"
+                  : rawHandedness === "Left"
+                  ? "Left"
+                  : "Right";
                 const score = handInfo?.score ?? 0.85;
                 const worldPts = result.worldLandmarks?.[idx] || pts;
 
@@ -525,7 +602,9 @@ export default function CameraStage({
               setVideoStatus((prev) => (prev === currentRes ? prev : currentRes));
               if (vw > 0 && vh > 0) {
                 const isPortrait = vh > vw;
-                setIsPortraitStream((prev) => (prev !== isPortrait ? isPortrait : prev));
+                setIsPortraitStream((prev) =>
+                  prev !== isPortrait ? isPortrait : prev
+                );
               }
             }
 
@@ -537,7 +616,7 @@ export default function CameraStage({
                   compact: false,
                   showLabels: true,
                   accentColor: activeClass?.color,
-                  mirrored
+                  mirrored,
                 });
               } else {
                 ctx.clearRect(0, 0, vw, vh);
@@ -569,8 +648,9 @@ export default function CameraStage({
             setVideoPaused((prev) => (prev ? prev : true));
           }
         } else if (cameraOn && video && video.readyState < 2) {
-          const nextStatus = `Connecting (ready: ${video.readyState})`;
-          setVideoStatus((prev) => (prev === nextStatus ? prev : nextStatus));
+          setVideoStatus((prev) =>
+            prev === "Starting camera…" ? prev : "Starting camera…"
+          );
         }
         const ctx = canvas.getContext("2d");
         ctx?.clearRect(0, 0, canvas.width, canvas.height);
@@ -590,70 +670,117 @@ export default function CameraStage({
   }, [cameraOn, showSkeleton, activeClass?.color, mirrored, isPaused]);
 
   // Capture a single frame + current 21-keypoint hand landmarks
-  const captureNow = useCallback((skipFlash: boolean = false): boolean => {
-    if (!activeClass) {
-      setCaptureNotice("Select or create a hand pose class first!");
-      setTimeout(() => setCaptureNotice(null), 2200);
-      return false;
-    }
+  const captureNow = useCallback(
+    (skipFlash: boolean = false): boolean => {
+      if (!activeClass) {
+        setCaptureNotice("Select or create a hand pose class first!");
+        setTimeout(() => setCaptureNotice(null), 2200);
+        return false;
+      }
 
-    const video = videoRef.current;
-    const hands = latestHandsRef.current;
+      const video = videoRef.current;
+      const hands = latestHandsRef.current;
 
-    if (!video || !cameraOn || video.readyState < 2) {
-      setCaptureNotice("Camera must be active to capture samples.");
-      setTimeout(() => setCaptureNotice(null), 2200);
-      return false;
-    }
+      if (!video || !cameraOn || isPaused || video.readyState < 2) {
+        setCaptureNotice("Turn on your camera first to capture samples.");
+        setTimeout(() => setCaptureNotice(null), 2200);
+        return false;
+      }
 
-    if (!hands || hands.length === 0) {
-      setCaptureNotice("Hold your hand clearly in front of the camera.");
-      setTimeout(() => setCaptureNotice(null), 1800);
-      return false;
-    }
+      if (!hands || hands.length === 0) {
+        setCaptureNotice(
+          "No hand detected — hold your hand clearly in frame to capture."
+        );
+        setTimeout(() => setCaptureNotice(null), 1800);
+        return false;
+      }
 
-    const tempCanvas = document.createElement("canvas");
-    const targetW = 320;
-    const targetH =
-      Math.round((video.videoHeight / (video.videoWidth || 640)) * targetW) ||
-      240;
-    tempCanvas.width = targetW;
-    tempCanvas.height = targetH;
-    const ctx = tempCanvas.getContext("2d");
-    if (!ctx) return false;
+      if (!captureCanvasRef.current) {
+        captureCanvasRef.current = document.createElement("canvas");
+      }
+      const tempCanvas = captureCanvasRef.current;
+      const targetW = 320;
+      const targetH =
+        Math.round((video.videoHeight / (video.videoWidth || 640)) * targetW) ||
+        240;
+      if (tempCanvas.width !== targetW || tempCanvas.height !== targetH) {
+        tempCanvas.width = targetW;
+        tempCanvas.height = targetH;
+      }
+      const ctx = tempCanvas.getContext("2d");
+      if (!ctx) return false;
 
-    ctx.drawImage(video, 0, 0, targetW, targetH);
-    const imageDataUrl = tempCanvas.toDataURL("image/jpeg", 0.82);
+      ctx.save();
+      if (mirrored) {
+        ctx.translate(targetW, 0);
+        ctx.scale(-1, 1);
+      }
+      ctx.drawImage(video, 0, 0, targetW, targetH);
+      ctx.restore();
 
-    const sample: CapturedSample = {
-      id: `smp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-      className: activeClass.name,
-      timestamp: Date.now(),
-      imageDataUrl,
-      width: targetW,
-      height: targetH,
-      hands: JSON.parse(JSON.stringify(hands)),
-    };
+      const imageDataUrl = tempCanvas.toDataURL("image/jpeg", 0.82);
 
-    onCaptureSample(sample);
-    if (!skipFlash) {
-      setFlashEffect(true);
-      setTimeout(() => setFlashEffect(false), 120);
-    }
-    return true;
-  }, [activeClass, cameraOn, onCaptureSample]);
+      // Align stored landmarks with the captured thumbnail orientation
+      const alignedHands: DetectedHand[] = hands.map((h) => ({
+        handedness: h.handedness,
+        score: h.score,
+        landmarks: h.landmarks.map((p) => ({
+          x: mirrored ? 1 - p.x : p.x,
+          y: p.y,
+          z: p.z,
+        })),
+        worldLandmarks: h.worldLandmarks.map((p) => ({
+          x: mirrored ? -p.x : p.x,
+          y: p.y,
+          z: p.z,
+        })),
+      }));
+
+      const sample: CapturedSample = {
+        id: `smp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        className: activeClass.name,
+        timestamp: Date.now(),
+        imageDataUrl,
+        width: targetW,
+        height: targetH,
+        hands: alignedHands,
+      };
+
+      onCaptureSample(sample);
+      if (!skipFlash) {
+        setFlashEffect(true);
+        setTimeout(() => setFlashEffect(false), 120);
+      }
+      return true;
+    },
+    [activeClass, cameraOn, isPaused, mirrored, onCaptureSample]
+  );
 
   // Spacebar shortcut for quick single capture
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement)?.tagName;
+      if (
+        !cameraOn ||
+        isPaused ||
+        e.repeat ||
+        e.ctrlKey ||
+        e.metaKey ||
+        e.altKey
+      ) {
+        return;
+      }
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
       if (
         tag === "INPUT" ||
         tag === "TEXTAREA" ||
         tag === "SELECT" ||
         tag === "BUTTON" ||
-        (e.target as HTMLElement)?.isContentEditable ||
-        (e.target as HTMLElement)?.closest?.('[role="dialog"], [aria-modal="true"]')
+        tag === "A" ||
+        target?.isContentEditable ||
+        target?.closest?.(
+          'button, a, input, select, textarea, [role="button"], [role="tab"], [role="dialog"], [aria-modal="true"]'
+        )
       ) {
         return;
       }
@@ -664,7 +791,7 @@ export default function CameraStage({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [captureNow]);
+  }, [captureNow, cameraOn, isPaused]);
 
   // 3-Second Countdown Timer Capture
   const startTimerCapture = () => {
@@ -703,7 +830,7 @@ export default function CameraStage({
 
   useEffect(() => {
     if (!isBursting) return;
-    if (!activeClass || !cameraOn) {
+    if (!activeClass || !cameraOn || isPaused) {
       setIsBursting(false);
       setBurstCount(0);
       return;
@@ -725,7 +852,7 @@ export default function CameraStage({
     }, 220);
 
     return () => clearInterval(interval);
-  }, [isBursting, burstTarget, captureNow, activeClass, cameraOn]);
+  }, [isBursting, burstTarget, captureNow, activeClass, cameraOn, isPaused]);
 
   const handDetected = liveHands.length > 0;
 
@@ -746,11 +873,17 @@ export default function CameraStage({
           <span className="text-xs font-semibold text-slate-100 truncate">
             {!cameraOn
               ? hasStartedOnce
-                ? "Camera Paused"
-                : "Camera Inactive"
+                ? "Camera Off"
+                : "Camera Ready"
               : handDetected
-              ? `${liveHands.length === 1 ? "1 Hand" : `${liveHands.length} Hands`} Tracked (${liveHands
-                  .map((h) => `${h.handedness[0]}: ${(h.score * 100).toFixed(0)}%`)
+              ? `${
+                  liveHands.length === 1
+                    ? "1 Hand"
+                    : `${liveHands.length} Hands`
+                } Tracked (${liveHands
+                  .map(
+                    (h) => `${h.handedness[0]}: ${(h.score * 100).toFixed(0)}%`
+                  )
                   .join(", ")})`
               : "Show hand(s) to the camera"}
           </span>
@@ -759,52 +892,74 @@ export default function CameraStage({
         {/* Stage Quick Toggles */}
         <div className="flex items-center gap-1.5 shrink-0">
           <button
+            type="button"
+            onClick={handleSwitchFacingMode}
+            title="Switch Front / Rear Camera"
+            aria-label="Switch Front or Rear Camera"
+            className="flex min-h-[36px] items-center gap-1 rounded-lg border border-ocean-700/60 bg-slate-900/60 px-2 py-1 text-xs font-medium text-slate-200 transition hover:bg-[#183959] hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+          >
+            <SwitchCamera className="h-3.5 w-3.5" aria-hidden="true" />
+            <span className="hidden xl:inline">Flip Cam</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => setMirrored((m) => !m)}
             title="Mirror Video Feed"
+            aria-pressed={mirrored}
             aria-label="Mirror Video Feed"
-            className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
+            className={`flex min-h-[36px] items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
               mirrored
                 ? "bg-[#183959] text-sky-200 border border-ocean-500/50"
-                : "bg-slate-900/60 text-slate-400 hover:text-slate-200 border border-transparent"
+                : "bg-slate-900/60 text-slate-300 hover:text-white border border-transparent"
             }`}
           >
-            <FlipHorizontal className="h-3.5 w-3.5" />
+            <FlipHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
             <span className="hidden sm:inline">Mirror</span>
           </button>
 
           <button
+            type="button"
             onClick={() => setShowSkeleton((s) => !s)}
             title="Toggle 21-Keypoint Skeleton Overlay"
-            aria-label={showSkeleton ? "Hide 21-Keypoint Skeleton Overlay" : "Show 21-Keypoint Skeleton Overlay"}
-            className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
+            aria-pressed={showSkeleton}
+            aria-label={
+              showSkeleton
+                ? "Hide 21-Keypoint Skeleton Overlay"
+                : "Show 21-Keypoint Skeleton Overlay"
+            }
+            className={`flex min-h-[36px] items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
               showSkeleton
                 ? "bg-[#183959] text-sky-200 border border-ocean-500/50"
-                : "bg-slate-900/60 text-slate-400 hover:text-slate-200 border border-transparent"
+                : "bg-slate-900/60 text-slate-300 hover:text-white border border-transparent"
             }`}
           >
             {showSkeleton ? (
-              <Eye className="h-3.5 w-3.5" />
+              <Eye className="h-3.5 w-3.5" aria-hidden="true" />
             ) : (
-              <EyeOff className="h-3.5 w-3.5" />
+              <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
             )}
             <span className="hidden sm:inline">Skeleton</span>
           </button>
 
           <button
+            type="button"
             onClick={() => setShowSettings((s) => !s)}
             title="Tracking Settings (Confidence, Engine, Hands)"
+            aria-expanded={showSettings}
             aria-label="Tracking Settings (Confidence, Engine, Hands)"
-            className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
+            className={`flex min-h-[36px] items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
               showSettings
                 ? "bg-amber-500/20 text-gold-200 border border-amber-500/40"
-                : "bg-slate-900/60 text-slate-400 hover:text-slate-200 border border-transparent"
+                : "bg-slate-900/60 text-slate-300 hover:text-white border border-transparent"
             }`}
           >
-            <Settings2 className="h-3.5 w-3.5" />
+            <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
             <span className="hidden sm:inline">Controls</span>
           </button>
 
           <button
+            type="button"
             onClick={() => {
               if (cameraOn) {
                 setCameraOn(false);
@@ -814,20 +969,20 @@ export default function CameraStage({
             }}
             title={cameraOn ? "Turn Off Camera" : "Turn On Camera"}
             aria-label={cameraOn ? "Turn Off Camera" : "Turn On Camera"}
-            className={`flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition ${
+            className={`flex min-h-[36px] items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
               cameraOn
-                ? "bg-rose-500/15 text-rose-300 border border-rose-500/30 hover:bg-rose-500/25"
-                : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30"
+                ? "bg-rose-500/15 text-rose-200 border border-rose-500/30 hover:bg-rose-500/25"
+                : "bg-emerald-500/20 text-emerald-200 border border-emerald-500/30 hover:bg-emerald-500/30"
             }`}
           >
             {cameraOn ? (
               <>
-                <CameraOff className="h-3.5 w-3.5" />
+                <CameraOff className="h-3.5 w-3.5" aria-hidden="true" />
                 <span className="hidden sm:inline">Stop</span>
               </>
             ) : (
               <>
-                <Camera className="h-3.5 w-3.5" />
+                <Camera className="h-3.5 w-3.5" aria-hidden="true" />
                 <span className="hidden sm:inline">Start</span>
               </>
             )}
@@ -837,9 +992,9 @@ export default function CameraStage({
 
       {/* Collapsible Tracking Settings Bar */}
       {showSettings && (
-        <div className="relative flex flex-wrap items-center justify-between gap-y-2.5 gap-x-4 border-b border-ocean-700/40 bg-[#0c1825]/95 px-3.5 py-2.5 text-xs text-slate-300 sm:px-4">
+        <div className="relative flex flex-wrap items-center justify-between gap-y-2.5 gap-x-4 border-b border-ocean-700/40 bg-[#0c1825]/95 px-3.5 py-2.5 text-xs text-slate-200 sm:px-4">
           <div className="flex items-center gap-2">
-            <span className="text-slate-300">Max Hands:</span>
+            <span className="text-slate-200">Max Hands:</span>
             <div className="flex rounded-lg border border-ocean-700/60 bg-[#08111a] p-0.5">
               {[1, 2].map((n) => (
                 <button
@@ -847,10 +1002,10 @@ export default function CameraStage({
                   type="button"
                   aria-pressed={maxHands === n}
                   onClick={() => setMaxHands(n as 1 | 2)}
-                  className={`rounded-md px-2.5 py-0.5 font-medium transition ${
+                  className={`min-h-[30px] rounded-md px-2.5 py-0.5 font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
                     maxHands === n
                       ? "bg-ocean-600 text-white font-semibold shadow-sm"
-                      : "text-slate-400 hover:text-white"
+                      : "text-slate-300 hover:text-white"
                   }`}
                 >
                   {n} {n === 1 ? "Hand" : "Hands"}
@@ -862,7 +1017,7 @@ export default function CameraStage({
           {/* Min Confidence with Interactive Tooltip Popover */}
           <div className="flex items-center gap-2">
             <div className="flex items-center gap-1.5">
-              <label htmlFor="stage-min-confidence" className="text-slate-300">
+              <label htmlFor="stage-min-confidence" className="text-slate-200">
                 Min Confidence: {(minConfidence * 100).toFixed(0)}%
               </label>
 
@@ -881,7 +1036,7 @@ export default function CameraStage({
                   aria-expanded={showConfidenceTooltip}
                   aria-controls="confidence-popover-content"
                 >
-                  <HelpCircle className="h-4 w-4" />
+                  <HelpCircle className="h-4 w-4" aria-hidden="true" />
                 </button>
 
                 {/* Accessible Info Popover Tooltip (Right-aligned on mobile to prevent overflow) */}
@@ -895,30 +1050,41 @@ export default function CameraStage({
                     <div className="rounded-xl border border-ocean-600/70 bg-[#0e2135] p-3.5 text-xs text-slate-200 shadow-2xl backdrop-blur-md">
                       <div className="flex items-center justify-between pb-1.5 border-b border-ocean-700/50 mb-2">
                         <span className="font-bold text-white flex items-center gap-1.5">
-                          <Info className="h-3.5 w-3.5 text-gold-200" />
+                          <Info className="h-3.5 w-3.5 text-gold-200" aria-hidden="true" />
                           Min Confidence ({(minConfidence * 100).toFixed(0)}%)
                         </span>
                         <button
+                          type="button"
                           onClick={() => setShowConfidenceTooltip(false)}
-                          className="rounded p-0.5 text-slate-400 hover:text-white"
+                          className="rounded p-1 text-slate-300 hover:text-white"
                           aria-label="Close tooltip"
                         >
-                          <X className="h-3 w-3" />
+                          <X className="h-3.5 w-3.5" />
                         </button>
                       </div>
-                      <p className="text-[11px] leading-relaxed text-slate-300">
-                        Sets how strictly MediaPipe requires a hand match before plotting 21 3D landmarks:
+                      <p className="text-xs leading-relaxed text-slate-200">
+                        Sets how strictly MediaPipe requires a hand match before
+                        plotting 21 3D landmarks:
                       </p>
-                      <div className="mt-2 space-y-1.5 text-[11px]">
+                      <div className="mt-2 space-y-1.5 text-xs">
                         <div className="rounded-lg bg-[#08121d] p-2 border border-ocean-800">
-                          <strong className="text-sky-300">Lower (25%–35%):</strong> Easier detection in dim light, rapid motion, or partial angles, with slight landmark jitter.
+                          <strong className="text-sky-300">
+                            Lower (25%–35%):
+                          </strong>{" "}
+                          Easier detection in dim light, rapid motion, or
+                          partial angles, with slight landmark jitter.
                         </div>
                         <div className="rounded-lg bg-[#08121d] p-2 border border-ocean-800">
-                          <strong className="text-amber-300">Higher (50%–70%):</strong> Stricter detection; requires a crisp, well-lit hand, filtering out background false-positives.
+                          <strong className="text-amber-300">
+                            Higher (50%–70%):
+                          </strong>{" "}
+                          Stricter detection; requires a crisp, well-lit hand,
+                          filtering out background false-positives.
                         </div>
                       </div>
-                      <p className="mt-2 text-[10px] text-sky-200/80">
-                        Default <strong>35%–40%</strong> is recommended for fluid, responsive studio capture.
+                      <p className="mt-2 text-xs text-sky-200/90">
+                        Default <strong>35%–40%</strong> is recommended for
+                        fluid, responsive studio capture.
                       </p>
                     </div>
                   </div>
@@ -940,7 +1106,7 @@ export default function CameraStage({
           </div>
 
           <div className="flex items-center gap-2">
-            <label htmlFor="stage-burst-target" className="text-slate-300">
+            <label htmlFor="stage-burst-target" className="text-slate-200">
               Burst:
             </label>
             <select
@@ -948,7 +1114,7 @@ export default function CameraStage({
               aria-label="Auto-burst capture photos count"
               value={burstTarget}
               onChange={(e) => setBurstTarget(Number(e.target.value))}
-              className="rounded-md border border-ocean-700/60 bg-[#08111a] px-2 py-0.5 text-slate-100"
+              className="min-h-[30px] rounded-md border border-ocean-700/60 bg-[#08111a] px-2 py-0.5 text-xs text-slate-100"
             >
               <option value={10}>10 photos</option>
               <option value={15}>15 photos</option>
@@ -957,7 +1123,7 @@ export default function CameraStage({
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="text-slate-300">Engine:</span>
+            <span className="text-slate-200">Engine:</span>
             <div className="flex rounded-lg border border-ocean-700/60 bg-[#08111a] p-0.5">
               {(["CPU", "GPU"] as const).map((d) => (
                 <button
@@ -968,10 +1134,10 @@ export default function CameraStage({
                     setActiveDelegate(d);
                     setRetryCount((r) => r + 1);
                   }}
-                  className={`rounded-md px-2.5 py-0.5 font-medium transition ${
+                  className={`min-h-[30px] rounded-md px-2.5 py-0.5 font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
                     activeDelegate === d
                       ? "bg-ocean-600 text-white font-semibold shadow-sm"
-                      : "text-slate-400 hover:text-white"
+                      : "text-slate-300 hover:text-white"
                   }`}
                 >
                   {d}
@@ -1011,39 +1177,39 @@ export default function CameraStage({
           className="pointer-events-none absolute inset-0 h-full w-full object-cover"
         />
 
-        {/* Live Diagnostics HUD (Top-Right) */}
-        <div className="absolute top-2.5 right-2.5 z-20 flex flex-col gap-0.5 sm:gap-1 rounded-lg border border-ocean-700/60 bg-[#081320]/85 px-2 py-1 sm:px-2.5 sm:py-1.5 font-mono text-[9px] sm:text-[10px] text-slate-200 backdrop-blur-sm pointer-events-none max-w-[150px] sm:max-w-none">
-          <div className="flex items-center gap-1.5">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                videoStatus.includes("Active") || videoStatus.includes("×")
-                  ? "bg-emerald-400 shadow-[0_0_6px_#34d399]"
-                  : videoStatus === "Off"
-                  ? "bg-slate-500"
-                  : "bg-amber-400 animate-pulse"
-              }`}
-            />
-            <span className="truncate">Cam: {videoStatus}</span>
-          </div>
-          <div className="flex items-center gap-1.5">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                modelReady
-                  ? "bg-sky-400 shadow-[0_0_6px_#38bdf8]"
-                  : "bg-amber-400"
-              }`}
-            />
-            <span className="truncate">
-              {activeDelegate} • {fpsVal} FPS • {liveHands.length}{" "}
-              {liveHands.length === 1 ? "hand" : "hands"}
-            </span>
-          </div>
-          {lastDetectError && (
-            <div className="text-rose-400 font-sans text-[9px] max-w-[140px] truncate">
-              {lastDetectError}
+        {/* Live Diagnostics HUD (Top-Right) — shown only when camera is active */}
+        {cameraOn && (
+          <div className="absolute top-2.5 right-2.5 z-20 flex flex-col gap-0.5 sm:gap-1 rounded-lg border border-ocean-700/60 bg-[#081320]/85 px-2.5 py-1.5 font-mono text-xs text-slate-200 backdrop-blur-sm pointer-events-none max-w-[180px] sm:max-w-none">
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  videoStatus.includes("×")
+                    ? "bg-emerald-400 shadow-[0_0_6px_#34d399]"
+                    : "bg-amber-400 animate-pulse"
+                }`}
+              />
+              <span className="truncate">Cam: {videoStatus}</span>
             </div>
-          )}
-        </div>
+            <div className="flex items-center gap-1.5">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  modelReady
+                    ? "bg-sky-400 shadow-[0_0_6px_#38bdf8]"
+                    : "bg-amber-400"
+                }`}
+              />
+              <span className="truncate">
+                {activeDelegate} &bull; {fpsVal} FPS &bull; {liveHands.length}{" "}
+                {liveHands.length === 1 ? "hand" : "hands"}
+              </span>
+            </div>
+            {lastDetectError && (
+              <div className="text-rose-300 font-sans text-xs max-w-[160px] truncate">
+                {lastDetectError}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Safari Autoplay Resume Overlay if blocked unexpectedly */}
         {!isPaused && videoPaused && cameraOn && (
@@ -1053,6 +1219,7 @@ export default function CameraStage({
                 Webcam stream is paused by your browser.
               </p>
               <button
+                type="button"
                 onClick={() => {
                   if (videoRef.current) {
                     videoRef.current.muted = true;
@@ -1060,9 +1227,9 @@ export default function CameraStage({
                     setVideoPaused(false);
                   }
                 }}
-                className="inline-flex items-center gap-2 rounded-xl bg-cyan-500 px-4 py-2 text-xs font-bold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-400 active:scale-95"
+                className="inline-flex min-h-[40px] items-center gap-2 rounded-xl bg-cyan-500 px-4 py-2 text-xs font-bold text-slate-950 shadow-lg shadow-cyan-500/25 transition hover:bg-cyan-400 active:scale-95"
               >
-                <Play className="h-4 w-4 fill-current" />
+                <Play className="h-4 w-4 fill-current" aria-hidden="true" />
                 <span>Resume Camera</span>
               </button>
             </div>
@@ -1076,7 +1243,12 @@ export default function CameraStage({
 
         {/* Countdown Overlay */}
         {countdown !== null && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-950/50 backdrop-blur-[2px]">
+          <div
+            role="timer"
+            aria-live="assertive"
+            aria-label={`Capturing in ${countdown} seconds`}
+            className="pointer-events-none absolute inset-0 flex items-center justify-center bg-slate-950/50 backdrop-blur-[2px]"
+          >
             <div className="flex h-28 w-28 items-center justify-center rounded-full border-2 border-cyan-400 bg-slate-900/90 text-5xl font-black text-cyan-300 shadow-2xl">
               {countdown}
             </div>
@@ -1085,7 +1257,11 @@ export default function CameraStage({
 
         {/* Burst Progress Pill */}
         {isBursting && (
-          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-full border border-amber-500/50 bg-slate-950/95 px-3.5 py-1.5 text-xs font-semibold text-amber-300 shadow-xl backdrop-blur-sm pointer-events-none whitespace-nowrap">
+          <div
+            role="status"
+            aria-live="polite"
+            className="absolute top-14 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 rounded-full border border-amber-500/50 bg-slate-950/95 px-3.5 py-1.5 text-xs font-semibold text-amber-200 shadow-xl backdrop-blur-sm pointer-events-none whitespace-nowrap"
+          >
             <span className="h-2 w-2 animate-ping rounded-full bg-amber-400" />
             <span>
               Auto-Burst ({burstCount} / {burstTarget}) — Hold pose
@@ -1095,7 +1271,11 @@ export default function CameraStage({
 
         {/* Transient Capture Notice */}
         {captureNotice && (
-          <div className="absolute bottom-16 left-1/2 -translate-x-1/2 rounded-lg border border-rose-500/40 bg-slate-950/95 px-4 py-2 text-xs font-medium text-rose-300 shadow-lg">
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="absolute bottom-16 left-1/2 -translate-x-1/2 z-20 rounded-lg border border-rose-500/40 bg-slate-950/95 px-4 py-2 text-xs font-medium text-rose-200 shadow-lg"
+          >
             {captureNotice}
           </div>
         )}
@@ -1108,7 +1288,7 @@ export default function CameraStage({
               <p className="text-sm font-semibold text-white">
                 Initializing 3D Hand Tracker…
               </p>
-              <p className="mt-1 text-xs text-slate-400">
+              <p className="mt-1 text-xs text-slate-300">
                 Loading MediaPipe WASM runtime &amp; 21-point hand model
               </p>
             </div>
@@ -1116,13 +1296,17 @@ export default function CameraStage({
         )}
 
         {modelError && (
-          <div className="absolute inset-4 flex flex-col items-center justify-center gap-3 rounded-xl border border-rose-500/30 bg-slate-950/95 p-6 text-center">
-            <p className="text-sm font-semibold text-rose-400">{modelError}</p>
+          <div
+            role="alert"
+            className="absolute inset-4 flex flex-col items-center justify-center gap-3 rounded-xl border border-rose-500/30 bg-slate-950/95 p-6 text-center"
+          >
+            <p className="text-sm font-semibold text-rose-300">{modelError}</p>
             <button
+              type="button"
               onClick={() => setRetryCount((c) => c + 1)}
-              className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-700"
+              className="flex min-h-[40px] items-center gap-1.5 rounded-lg bg-slate-800 px-3.5 py-2 text-xs font-semibold text-white hover:bg-slate-700"
             >
-              <RefreshCw className="h-3.5 w-3.5" />
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
               <span>Retry Loading Tracker</span>
             </button>
           </div>
@@ -1140,45 +1324,46 @@ export default function CameraStage({
               }`}
             >
               {cameraError || hasStartedOnce ? (
-                <CameraOff className="h-7 w-7" />
+                <CameraOff className="h-7 w-7" aria-hidden="true" />
               ) : (
-                <Camera className="h-7 w-7" />
+                <Camera className="h-7 w-7" aria-hidden="true" />
               )}
             </div>
 
             <div className="max-w-sm">
               <p className="text-sm font-semibold text-slate-100">
                 {cameraError
-                  ? "Camera Unavailable"
+                  ? "Camera Access Blocked or Unavailable"
                   : hasStartedOnce
-                  ? "Camera Stream Paused"
-                  : "Camera is Inactive"}
+                  ? "Camera Turned Off"
+                  : "Ready for 3D Hand Tracking"}
               </p>
-              <p className="mt-1 text-xs text-slate-400 leading-relaxed">
+              <p className="mt-1 text-xs text-slate-300 leading-relaxed">
                 {cameraError ||
                   (hasStartedOnce
-                    ? "Click Resume Camera below to continue tracking your hand poses."
-                    : "Click below to enable your camera and begin real-time 3D hand tracking.")}
+                    ? "Your webcam is currently off. Click Resume Camera below when you're ready to continue."
+                    : "Enable your webcam to track 21 3D hand joints in real time — processed 100% locally in your browser.")}
               </p>
             </div>
 
             <button
+              type="button"
               onClick={handleEnableCamera}
-              className="mt-1 flex items-center gap-2 rounded-xl bg-gradient-to-r from-terracotta-500 to-terracotta-600 px-5 py-2.5 text-xs font-bold text-white shadow-lg shadow-terracotta-950/50 transition hover:from-terracotta-400 hover:to-terracotta-500 active:scale-95"
+              className="mt-1 flex min-h-[42px] items-center gap-2 rounded-xl bg-gradient-to-r from-terracotta-600 to-terracotta-700 px-5 py-2.5 text-xs font-bold text-white shadow-lg shadow-terracotta-950/50 transition hover:from-terracotta-500 hover:to-terracotta-600 active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-gold-300"
             >
               {cameraError ? (
                 <>
-                  <RefreshCw className="h-3.5 w-3.5" />
+                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                   <span>Retry Camera Access</span>
                 </>
               ) : hasStartedOnce ? (
                 <>
-                  <Play className="h-3.5 w-3.5" />
+                  <Play className="h-3.5 w-3.5" aria-hidden="true" />
                   <span>Resume Camera</span>
                 </>
               ) : (
                 <>
-                  <Camera className="h-4 w-4" />
+                  <Camera className="h-4 w-4" aria-hidden="true" />
                   <span>Enable Camera</span>
                 </>
               )}
@@ -1186,28 +1371,53 @@ export default function CameraStage({
           </div>
         )}
 
-        {/* Active Recording Class Badge Overlay (Top-Left) */}
+        {/* Active Recording Class Selector Overlay (Top-Left) */}
         {activeClass && cameraOn && (
-          <div className="pointer-events-none absolute top-2.5 left-2.5 sm:top-3 sm:left-3 flex items-center gap-1.5 sm:gap-2 rounded-lg border border-ocean-700/70 bg-[#0a1624]/90 px-2 py-1 sm:px-3 sm:py-1.5 backdrop-blur-md max-w-[140px] sm:max-w-none">
+          <div className="absolute top-2.5 left-2.5 sm:top-3 sm:left-3 z-20 flex items-center gap-1.5 sm:gap-2 rounded-lg border border-ocean-700/70 bg-[#0a1624]/90 px-2.5 py-1.5 backdrop-blur-md">
             <span
-              className="h-2 w-2 sm:h-2.5 sm:w-2.5 shrink-0 rounded-full"
+              className="h-2.5 w-2.5 shrink-0 rounded-full"
               style={{ backgroundColor: activeClass.color }}
             />
-            <span className="text-[11px] sm:text-xs text-slate-300 truncate">
-              Target:{" "}
-              <strong className="font-semibold text-white">
-                {activeClass.name}
-              </strong>
-            </span>
+            {classes.length > 1 && onSelectClass ? (
+              <label className="flex items-center gap-1.5 text-xs text-slate-200">
+                <span className="hidden sm:inline text-slate-300">Target:</span>
+                <select
+                  aria-label="Active target pose class"
+                  value={activeClass.name}
+                  onChange={(e) => onSelectClass(e.target.value)}
+                  className="rounded bg-[#112437] px-1.5 py-0.5 font-semibold text-white text-xs border border-ocean-600/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 cursor-pointer"
+                >
+                  {classes.map((c) => (
+                    <option key={c.name} value={c.name}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : (
+              <span className="text-xs text-slate-200 truncate">
+                Target:{" "}
+                <strong className="font-semibold text-white">
+                  {activeClass.name}
+                </strong>
+              </span>
+            )}
           </div>
         )}
 
         {/* Live Real-Time Prediction HUD Overlay */}
         {classifierActive && livePrediction && handDetected && (
-          <div className="pointer-events-none absolute bottom-2.5 left-2.5 sm:bottom-3 sm:left-3 w-[200px] sm:w-[250px] max-w-[calc(100%-1.25rem)] rounded-xl border border-ocean-400/30 bg-[#081524]/90 px-2.5 py-1.5 sm:px-3 sm:py-2 shadow-xl backdrop-blur-md">
+          <div
+            role="status"
+            aria-live="off"
+            className="pointer-events-none absolute bottom-2.5 left-2.5 sm:bottom-3 sm:left-3 w-[220px] sm:w-[270px] max-w-[calc(100%-1.25rem)] rounded-xl border border-ocean-400/30 bg-[#081524]/90 px-3 py-2 shadow-xl backdrop-blur-md"
+          >
             <div className="flex items-center justify-between gap-2.5">
               <div className="flex items-center gap-1.5 min-w-0">
-                <Sparkles className="h-3.5 w-3.5 text-gold-300 shrink-0" />
+                <Sparkles
+                  className="h-3.5 w-3.5 text-gold-300 shrink-0"
+                  aria-hidden="true"
+                />
                 <span className="truncate text-xs sm:text-sm font-bold text-white">
                   {livePrediction.className}
                 </span>
@@ -1219,16 +1429,16 @@ export default function CameraStage({
 
             {/* Compact Top-2 Alternative Class Probabilities */}
             {livePrediction.probabilities.length > 1 && (
-              <div className="mt-1.5 flex flex-col gap-1 border-t border-ocean-700/50 pt-1">
+              <div className="mt-1.5 flex flex-col gap-1 border-t border-ocean-700/50 pt-1.5">
                 {livePrediction.probabilities.slice(0, 2).map((item) => (
                   <div
                     key={item.className}
-                    className="flex items-center gap-1.5 text-[10px]"
+                    className="flex items-center gap-2 text-xs"
                   >
-                    <span className="w-14 truncate text-right text-slate-300">
+                    <span className="w-20 sm:w-24 truncate text-right text-slate-200">
                       {item.className}
                     </span>
-                    <div className="h-1.5 min-w-[60px] flex-1 overflow-hidden rounded-full bg-slate-900/80 border border-white/5">
+                    <div className="h-1.5 min-w-[50px] flex-1 overflow-hidden rounded-full bg-slate-900/80 border border-white/5">
                       <div
                         className="h-full rounded-full transition-all duration-150"
                         style={{
@@ -1237,7 +1447,7 @@ export default function CameraStage({
                         }}
                       />
                     </div>
-                    <span className="w-7 text-right font-mono text-[9px] text-slate-400">
+                    <span className="w-8 text-right font-mono text-xs text-slate-300">
                       {(item.probability * 100).toFixed(0)}%
                     </span>
                   </div>
@@ -1250,11 +1460,11 @@ export default function CameraStage({
 
       {/* Capture Action Deck (Responsive touch-friendly layout) */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-ocean-700/50 bg-gradient-to-r from-[#102235] to-[#142b44] px-4 py-3 rounded-b-2xl">
-        <div className="flex items-center gap-2 text-xs text-sky-200/80">
-          <Hand className="h-4 w-4 text-terracotta-400 shrink-0" />
+        <div className="flex items-center gap-2 text-xs text-sky-100">
+          <Hand className="h-4 w-4 text-terracotta-400 shrink-0" aria-hidden="true" />
           <span>
             Shortcut: press{" "}
-            <kbd className="rounded border border-ocean-600/50 bg-[#091522] px-1.5 py-0.5 font-mono text-[11px] text-slate-200">
+            <kbd className="rounded border border-ocean-600/50 bg-[#091522] px-1.5 py-0.5 font-mono text-xs text-slate-100">
               Space
             </kbd>{" "}
             to capture
@@ -1263,44 +1473,47 @@ export default function CameraStage({
 
         <div className="grid grid-cols-1 min-[380px]:grid-cols-3 sm:flex sm:flex-wrap items-center gap-2 w-full sm:w-auto">
           <button
+            type="button"
             onClick={() => captureNow()}
             disabled={!cameraOn || !activeClass}
-            className="flex items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-terracotta-500 to-terracotta-600 px-3 sm:px-4 py-2.5 text-xs font-bold text-white shadow-md shadow-terracotta-950/40 transition hover:from-terracotta-400 hover:to-terracotta-500 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-terracotta-600 to-terracotta-700 px-3 sm:px-4 py-2.5 text-xs font-bold text-white shadow-md shadow-terracotta-950/40 transition hover:from-terracotta-500 hover:to-terracotta-600 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-gold-300"
           >
-            <Camera className="h-4 w-4" />
+            <Camera className="h-4 w-4" aria-hidden="true" />
             <span>Capture Photo</span>
           </button>
 
           <button
+            type="button"
             onClick={startTimerCapture}
             disabled={!cameraOn || !activeClass || countdown !== null}
             title="3-second countdown before capturing"
-            className="flex items-center justify-center gap-1.5 rounded-xl border border-ocean-600/60 bg-[#163554]/90 px-3 sm:px-3.5 py-2.5 text-xs font-semibold text-slate-100 transition hover:bg-[#1f456c] disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-ocean-600/60 bg-[#163554]/90 px-3 sm:px-3.5 py-2.5 text-xs font-semibold text-slate-100 transition hover:bg-[#1f456c] disabled:cursor-not-allowed disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
           >
-            <Timer className="h-4 w-4 text-gold-300" />
+            <Timer className="h-4 w-4 text-gold-300" aria-hidden="true" />
             <span>3s Timer</span>
           </button>
 
           <button
+            type="button"
             onClick={toggleBurstCapture}
             disabled={!cameraOn || !activeClass}
             title={`Automatically capture ${burstTarget} frames while your hand is in view`}
-            className={`flex items-center justify-center gap-1.5 rounded-xl px-3 sm:px-3.5 py-2.5 text-xs font-semibold transition ${
+            className={`flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl px-3 sm:px-3.5 py-2.5 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-gold-300 ${
               isBursting
-                ? "border border-rose-500/50 bg-rose-500/20 text-rose-300"
+                ? "border border-rose-500/50 bg-rose-500/20 text-rose-200"
                 : "border border-gold-300/40 bg-gold-200/15 text-gold-100 hover:bg-gold-200/25"
             } disabled:cursor-not-allowed disabled:opacity-40`}
           >
             {isBursting ? (
               <>
-                <Square className="h-3.5 w-3.5 fill-current" />
+                <Square className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
                 <span>
                   Stop ({burstCount}/{burstTarget})
                 </span>
               </>
             ) : (
               <>
-                <Zap className="h-4 w-4 text-gold-300" />
+                <Zap className="h-4 w-4 text-gold-300" aria-hidden="true" />
                 <span>Auto-Burst ({burstTarget})</span>
               </>
             )}
