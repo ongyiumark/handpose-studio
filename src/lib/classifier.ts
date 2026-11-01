@@ -1,4 +1,5 @@
 import * as tf from "@tensorflow/tfjs";
+import * as Sentry from "@sentry/nextjs";
 import {
   CapturedSample,
   DetectedHand,
@@ -152,7 +153,22 @@ export async function ensureTFBackend(): Promise<string> {
     }
   }
   await tf.ready();
-  return tf.getBackend();
+  const backend = tf.getBackend();
+
+  if (typeof window !== "undefined") {
+    Sentry.setTag("tf_backend", backend);
+    Sentry.setContext("hardware_profile", {
+      cores: typeof navigator !== "undefined" ? navigator.hardwareConcurrency || "unknown" : "unknown",
+      webgl_supported: typeof window !== "undefined" ? Boolean(window.WebGLRenderingContext) : false,
+      webgl2_supported: typeof window !== "undefined" ? Boolean(window.WebGL2RenderingContext) : false,
+      device_memory:
+        typeof navigator !== "undefined" && "deviceMemory" in navigator
+          ? (navigator as unknown as { deviceMemory: number }).deviceMemory
+          : "unknown",
+    });
+  }
+
+  return backend;
 }
 
 /**
@@ -168,134 +184,158 @@ export async function trainMLPClassifier(
   history: TrainingHistoryPoint[];
   serializedModel: SerializedTFModel;
 }> {
-  await ensureTFBackend();
-
-  const prepared = prepareTrainingDataset(samples, config.useAugmentation, 4);
-  const { classes } = prepared;
-
-  if (classes.length < 2) {
-    throw new Error(
-      "At least 2 distinct pose classes with valid hand landmarks are required to train a classifier."
-    );
-  }
-
-  const { shuffledFeatures, shuffledLabels } = shuffleDataset(
-    prepared.features,
-    prepared.labels
-  );
-
-  const numClasses = classes.length;
-  const inputDim = prepared.features[0]?.length || FEATURE_VECTOR_SIZE;
-  const xs = tf.tensor2d(shuffledFeatures, [shuffledFeatures.length, inputDim]);
-  const labelsTensor = tf.tensor1d(shuffledLabels, "int32");
-  const ys = tf.oneHot(labelsTensor, numClasses);
-  labelsTensor.dispose();
-
-  const model = tf.sequential();
-  model.add(
-    tf.layers.dense({
-      inputShape: [inputDim],
-      units: config.hiddenUnits,
-      activation: "relu",
-      kernelInitializer: "heNormal",
-    })
-  );
-  model.add(tf.layers.dropout({ rate: 0.2 }));
-  model.add(
-    tf.layers.dense({
-      units: Math.max(16, Math.floor(config.hiddenUnits / 2)),
-      activation: "relu",
-    })
-  );
-  model.add(
-    tf.layers.dense({
-      units: numClasses,
-      activation: "softmax",
-    })
-  );
-
-  model.compile({
-    optimizer: tf.train.adam(config.learningRate),
-    loss: "categoricalCrossentropy",
-    metrics: ["accuracy"],
-  });
-
-  const history: TrainingHistoryPoint[] = [];
-
-  const distinctValClasses = new Set(prepared.valLabels || []).size;
-  const hasValidationData = Boolean(
-    prepared.valFeatures &&
-    prepared.valFeatures.length > 0 &&
-    prepared.valLabels &&
-    prepared.valLabels.length > 0 &&
-    distinctValClasses >= 2
-  );
-
-  let valXs: tf.Tensor2D | null = null;
-  let valYs: tf.Tensor | null = null;
-
-  if (hasValidationData && prepared.valFeatures && prepared.valLabels) {
-    valXs = tf.tensor2d(prepared.valFeatures, [
-      prepared.valFeatures.length,
-      inputDim,
-    ]);
-    const valLabelsTensor = tf.tensor1d(prepared.valLabels, "int32");
-    valYs = tf.oneHot(valLabelsTensor, numClasses);
-    valLabelsTensor.dispose();
-  }
-
-  // Yield one animation frame so the UI paints the initial training state before computation begins
-  await tf.nextFrame();
-
-  let trainedSuccessfully = false;
-  try {
-    await model.fit(xs, ys, {
-      epochs: config.epochs,
-      batchSize: config.batchSize,
-      validationData: valXs && valYs ? [valXs, valYs] : undefined,
-      shuffle: true,
-      callbacks: {
-        onEpochEnd: async (epoch, logs) => {
-          const point: TrainingHistoryPoint = {
-            epoch: epoch + 1,
-            loss: Number((logs?.loss ?? 0).toFixed(4)),
-            accuracy: Number(((logs?.acc ?? logs?.accuracy ?? 0) * 100).toFixed(1)),
-            valLoss:
-              logs?.val_loss !== undefined
-                ? Number(logs.val_loss.toFixed(4))
-                : undefined,
-            valAccuracy:
-              logs?.val_acc !== undefined || logs?.val_accuracy !== undefined
-                ? Number(
-                    ((logs?.val_acc ?? logs?.val_accuracy ?? 0) * 100).toFixed(1)
-                  )
-                : undefined,
-          };
-          history.push(point);
-          onProgress(point);
-          await tf.nextFrame();
-        },
+  return await Sentry.startSpan(
+    {
+      name: "train_mlp_classifier",
+      op: "ml.train",
+      attributes: {
+        samples_count: samples.length,
+        epochs: config.epochs,
+        batch_size: config.batchSize,
+        learning_rate: config.learningRate,
+        hidden_units: config.hiddenUnits,
+        use_augmentation: config.useAugmentation,
       },
-    });
+    },
+    async (span) => {
+      await ensureTFBackend();
 
-    const serializedModel = await serializeTFModel(model);
-    trainedSuccessfully = true;
+      const prepared = prepareTrainingDataset(samples, config.useAugmentation, 4);
+      const { classes } = prepared;
 
-    return {
-      model,
-      classes,
-      history,
-      serializedModel,
-    };
-  } finally {
-    xs.dispose();
-    ys.dispose();
-    valXs?.dispose();
-    valYs?.dispose();
-    if (!trainedSuccessfully) {
-      model.dispose();
+      span?.setAttribute("classes_count", classes.length);
+
+      if (classes.length < 2) {
+        throw new Error(
+          "At least 2 distinct pose classes with valid hand landmarks are required to train a classifier."
+        );
+      }
+
+      const { shuffledFeatures, shuffledLabels } = shuffleDataset(
+        prepared.features,
+        prepared.labels
+      );
+
+      const numClasses = classes.length;
+      const inputDim = prepared.features[0]?.length || FEATURE_VECTOR_SIZE;
+      const xs = tf.tensor2d(shuffledFeatures, [shuffledFeatures.length, inputDim]);
+      const labelsTensor = tf.tensor1d(shuffledLabels, "int32");
+      const ys = tf.oneHot(labelsTensor, numClasses);
+      labelsTensor.dispose();
+
+      const model = tf.sequential();
+      model.add(
+        tf.layers.dense({
+          inputShape: [inputDim],
+          units: config.hiddenUnits,
+          activation: "relu",
+          kernelInitializer: "heNormal",
+        })
+      );
+      model.add(tf.layers.dropout({ rate: 0.2 }));
+      model.add(
+        tf.layers.dense({
+          units: Math.max(16, Math.floor(config.hiddenUnits / 2)),
+          activation: "relu",
+        })
+      );
+      model.add(
+        tf.layers.dense({
+          units: numClasses,
+          activation: "softmax",
+        })
+      );
+
+      model.compile({
+        optimizer: tf.train.adam(config.learningRate),
+        loss: "categoricalCrossentropy",
+        metrics: ["accuracy"],
+      });
+
+      const history: TrainingHistoryPoint[] = [];
+
+      const distinctValClasses = new Set(prepared.valLabels || []).size;
+      const hasValidationData = Boolean(
+        prepared.valFeatures &&
+        prepared.valFeatures.length > 0 &&
+        prepared.valLabels &&
+        prepared.valLabels.length > 0 &&
+        distinctValClasses >= 2
+      );
+
+      let valXs: tf.Tensor2D | null = null;
+      let valYs: tf.Tensor | null = null;
+
+      if (hasValidationData && prepared.valFeatures && prepared.valLabels) {
+        valXs = tf.tensor2d(prepared.valFeatures, [
+          prepared.valFeatures.length,
+          inputDim,
+        ]);
+        const valLabelsTensor = tf.tensor1d(prepared.valLabels, "int32");
+        valYs = tf.oneHot(valLabelsTensor, numClasses);
+        valLabelsTensor.dispose();
+      }
+
+      // Yield one animation frame so the UI paints the initial training state before computation begins
+      await tf.nextFrame();
+
+      let trainedSuccessfully = false;
+      try {
+        await model.fit(xs, ys, {
+          epochs: config.epochs,
+          batchSize: config.batchSize,
+          validationData: valXs && valYs ? [valXs, valYs] : undefined,
+          shuffle: true,
+          callbacks: {
+            onEpochEnd: async (epoch, logs) => {
+              const point: TrainingHistoryPoint = {
+                epoch: epoch + 1,
+                loss: Number((logs?.loss ?? 0).toFixed(4)),
+                accuracy: Number(((logs?.acc ?? logs?.accuracy ?? 0) * 100).toFixed(1)),
+                valLoss:
+                  logs?.val_loss !== undefined
+                    ? Number(logs.val_loss.toFixed(4))
+                    : undefined,
+                valAccuracy:
+                  logs?.val_acc !== undefined || logs?.val_accuracy !== undefined
+                    ? Number(
+                        ((logs?.val_acc ?? logs?.val_accuracy ?? 0) * 100).toFixed(1)
+                      )
+                    : undefined,
+              };
+              history.push(point);
+              onProgress(point);
+              await tf.nextFrame();
+            },
+          },
+        });
+
+        const serializedModel = await serializeTFModel(model);
+        trainedSuccessfully = true;
+
+        const lastPoint = history[history.length - 1];
+        if (lastPoint) {
+          span?.setAttribute("final_accuracy", lastPoint.accuracy);
+          span?.setAttribute("final_loss", lastPoint.loss);
+        }
+
+        return {
+          model,
+          classes,
+          history,
+          serializedModel,
+        };
+      } finally {
+        xs.dispose();
+        ys.dispose();
+        valXs?.dispose();
+        valYs?.dispose();
+        if (!trainedSuccessfully) {
+          model.dispose();
+        }
+      }
     }
-  }
+  );
 }
 
 /**

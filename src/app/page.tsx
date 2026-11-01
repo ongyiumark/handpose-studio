@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as tf from "@tensorflow/tfjs";
+import * as Sentry from "@sentry/nextjs";
 import Navbar from "@/components/Navbar";
 import CameraStage from "@/components/CameraStage";
 import ClassManager from "@/components/ClassManager";
@@ -37,9 +38,11 @@ import {
 import { exportDatasetZip, exportTrainedModelZip } from "@/lib/export";
 import { generateDemoDataset } from "@/lib/demoData";
 import {
+  AlertTriangle,
   ArrowRight,
   BookOpen,
   BrainCircuit,
+  CameraOff,
   FolderPlus,
   Layers,
   Sparkles,
@@ -623,18 +626,38 @@ export default function HandPoseStudioPage() {
       <main className="mx-auto grid w-full max-w-[1600px] flex-1 grid-cols-1 gap-5 p-3.5 sm:p-6 lg:grid-cols-12">
         {/* Left Column: Live Camera + MediaPipe 3D Stage (5 cols on lg) */}
         <div className="flex flex-col gap-4 lg:col-span-5">
-          <CameraStage
-            activeClass={activeClass}
-            onCaptureSample={handleCaptureSample}
-            onHandsDetected={handleHandsDetected}
-            onModelStatusChange={setModelReady}
-            livePrediction={livePrediction}
-            classifierActive={
-              Boolean(trainedModelRecord) ||
-              (trainingConfig.classifierType === "knn" && workspaceExemplars.length >= 2)
-            }
-            isPaused={isAnyModalOpen}
-          />
+          <Sentry.ErrorBoundary
+            fallback={({ error, resetError }) => (
+              <div className="flex flex-col items-center justify-center p-8 rounded-2xl border border-red-500/30 bg-red-950/20 text-center text-slate-200">
+                <div className="h-10 w-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 mb-3">
+                  <CameraOff className="h-5 w-5" />
+                </div>
+                <h3 className="font-semibold text-white mb-1">Camera Stage Error</h3>
+                <p className="text-xs text-slate-400 max-w-sm mb-4">
+                  {error instanceof Error ? error.message : "An unexpected camera stage error occurred."}
+                </p>
+                <button
+                  onClick={() => resetError()}
+                  className="px-4 py-2 rounded-xl bg-ocean-600 hover:bg-ocean-500 text-xs font-medium text-white transition-colors"
+                >
+                  Restart Camera Stage
+                </button>
+              </div>
+            )}
+          >
+            <CameraStage
+              activeClass={activeClass}
+              onCaptureSample={handleCaptureSample}
+              onHandsDetected={handleHandsDetected}
+              onModelStatusChange={setModelReady}
+              livePrediction={livePrediction}
+              classifierActive={
+                Boolean(trainedModelRecord) ||
+                (trainingConfig.classifierType === "knn" && workspaceExemplars.length >= 2)
+              }
+              isPaused={isAnyModalOpen}
+            />
+          </Sentry.ErrorBoundary>
 
           {/* Helpful Starter Callout when 0 samples exist */}
           {samples.length === 0 && (
@@ -762,18 +785,38 @@ export default function HandPoseStudioPage() {
 
           {/* Step 2 Panel: Train & Test Live */}
           {(activeStepTab === "train" || activeStepTab === "all") && (
-            <TrainerPanel
-              samples={samples}
-              config={trainingConfig}
-              onChangeConfig={setTrainingConfig}
-              isTraining={isTraining}
-              trainingProgress={trainingProgress}
-              trainedModel={trainedModelRecord}
-              livePrediction={livePrediction}
-              onStartTraining={handleStartTraining}
-              onExportModelZip={handleExportModelZip}
-              onSaveModelLocally={handleSaveModelLocally}
-            />
+            <Sentry.ErrorBoundary
+              fallback={({ error, resetError }) => (
+                <div className="flex flex-col items-center justify-center p-8 rounded-2xl border border-red-500/30 bg-red-950/20 text-center text-slate-200">
+                  <div className="h-10 w-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 mb-3">
+                    <AlertTriangle className="h-5 w-5" />
+                  </div>
+                  <h3 className="font-semibold text-white mb-1">Trainer Panel Error</h3>
+                  <p className="text-xs text-slate-400 max-w-sm mb-4">
+                    {error instanceof Error ? error.message : "An unexpected trainer panel error occurred."}
+                  </p>
+                  <button
+                    onClick={() => resetError()}
+                    className="px-4 py-2 rounded-xl bg-ocean-600 hover:bg-ocean-500 text-xs font-medium text-white transition-colors"
+                  >
+                    Retry Trainer Panel
+                  </button>
+                </div>
+              )}
+            >
+              <TrainerPanel
+                samples={samples}
+                config={trainingConfig}
+                onChangeConfig={setTrainingConfig}
+                isTraining={isTraining}
+                trainingProgress={trainingProgress}
+                trainedModel={trainedModelRecord}
+                livePrediction={livePrediction}
+                onStartTraining={handleStartTraining}
+                onExportModelZip={handleExportModelZip}
+                onSaveModelLocally={handleSaveModelLocally}
+              />
+            </Sentry.ErrorBoundary>
           )}
         </div>
       </main>
