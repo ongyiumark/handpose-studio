@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import * as Sentry from "@sentry/nextjs";
 import {
   Camera,
   CameraOff,
@@ -59,6 +60,7 @@ export default function CameraStage({
   const lastStateUpdateRef = useRef<number>(0);
   const fpsTimestampsRef = useRef<number[]>([]);
   const latestHandsRef = useRef<DetectedHand[]>([]);
+  const lastReportedDetectErrorRef = useRef<string | null>(null);
   const onHandsDetectedRef = useRef(onHandsDetected);
   useEffect(() => {
     onHandsDetectedRef.current = onHandsDetected;
@@ -510,6 +512,7 @@ export default function CameraStage({
             onHandsDetectedRef.current(detected, currentFps);
             setVideoPaused((prev) => (prev ? false : prev));
             setLastDetectError((prev) => (prev ? null : prev));
+            lastReportedDetectErrorRef.current = null;
 
             // Throttle React state telemetry to ~10 FPS to keep main thread fast and prevent frame drops
             if (nowMs - lastStateUpdateRef.current >= 100) {
@@ -544,6 +547,20 @@ export default function CameraStage({
             const msg = err instanceof Error ? err.message : String(err);
             setLastDetectError(msg);
             console.warn("Detection frame skipped:", err);
+
+            // Circuit breaker: only report to Sentry when the error changes to prevent 30-60 FPS spam
+            if (lastReportedDetectErrorRef.current !== msg) {
+              lastReportedDetectErrorRef.current = msg;
+              Sentry.captureException(err, {
+                tags: { context: "camera_stage_raf_loop" },
+                extra: {
+                  videoWidth: video?.videoWidth,
+                  videoHeight: video?.videoHeight,
+                  videoReadyState: video?.readyState,
+                  hasLandmarker: Boolean(landmarker),
+                },
+              });
+            }
           }
         }
       } else if (canvas) {

@@ -1,5 +1,6 @@
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
+import * as Sentry from "@sentry/nextjs";
 import {
   CapturedSample,
   PoseClassMeta,
@@ -98,58 +99,71 @@ export async function exportDatasetZip(
   samples: CapturedSample[],
   datasetName = "handpose-dataset"
 ) {
-  const zip = new JSZip();
-  const safeRoot =
-    datasetName.trim().replace(/[^a-zA-Z0-9_-]/g, "-") || "handpose-dataset";
-  const root = zip.folder(safeRoot);
-  if (!root) return;
-
-  for (const [idx, sample] of samples.entries()) {
-    const safeClass =
-      sample.className.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "unlabeled";
-    const classFolder = root.folder(safeClass);
-    if (!classFolder) continue;
-
-    const shortId = sample.id.slice(0, 8);
-    const baseName = `${safeClass}-${idx+1}_${shortId}`;
-
-    if (sample.imageDataUrl && sample.imageDataUrl.includes(",")) {
-      const [header, base64Img] = sample.imageDataUrl.split(",");
-      let ext = "jpeg";
-      if (header.includes("image/png")) ext = "png";
-      else if (header.includes("image/webp")) ext = "webp";
-      classFolder.file(`${baseName}.${ext}`, base64Img, { base64: true });
-    }
-
-    const annotationPayload = formatHandAnnotationsForExport(
-      sample.hands,
-      sample.width,
-      sample.height
-    );
-    classFolder.file(
-      `${baseName}.json`,
-      JSON.stringify(annotationPayload, null, 2)
-    );
-  }
-
-  // Add tabular CSV and full JSON manifest
-  root.file("landmarks.csv", buildLandmarksCsvString(samples));
-  root.file(
-    "dataset-manifest.json",
-    JSON.stringify(
-      {
-        name: datasetName,
-        exportedAt: new Date().toISOString(),
-        totalSamples: samples.length,
-        classes,
+  return await Sentry.startSpan(
+    {
+      name: "export_dataset_zip",
+      op: "data.export",
+      attributes: {
+        samples_count: samples.length,
+        classes_count: classes.length,
+        dataset_name: datasetName,
       },
-      null,
-      2
-    )
-  );
+    },
+    async () => {
+      const zip = new JSZip();
+      const safeRoot =
+        datasetName.trim().replace(/[^a-zA-Z0-9_-]/g, "-") || "handpose-dataset";
+      const root = zip.folder(safeRoot);
+      if (!root) return;
 
-  const blob = await zip.generateAsync({ type: "blob" });
-  saveAs(blob, `${safeRoot}-${Date.now().toString().slice(-6)}.zip`);
+      for (const [idx, sample] of samples.entries()) {
+        const safeClass =
+          sample.className.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "unlabeled";
+        const classFolder = root.folder(safeClass);
+        if (!classFolder) continue;
+
+        const shortId = sample.id.slice(0, 8);
+        const baseName = `${safeClass}-${idx + 1}_${shortId}`;
+
+        if (sample.imageDataUrl && sample.imageDataUrl.includes(",")) {
+          const [header, base64Img] = sample.imageDataUrl.split(",");
+          let ext = "jpeg";
+          if (header.includes("image/png")) ext = "png";
+          else if (header.includes("image/webp")) ext = "webp";
+          classFolder.file(`${baseName}.${ext}`, base64Img, { base64: true });
+        }
+
+        const annotationPayload = formatHandAnnotationsForExport(
+          sample.hands,
+          sample.width,
+          sample.height
+        );
+        classFolder.file(
+          `${baseName}.json`,
+          JSON.stringify(annotationPayload, null, 2)
+        );
+      }
+
+      // Add tabular CSV and full JSON manifest
+      root.file("landmarks.csv", buildLandmarksCsvString(samples));
+      root.file(
+        "dataset-manifest.json",
+        JSON.stringify(
+          {
+            name: datasetName,
+            exportedAt: new Date().toISOString(),
+            totalSamples: samples.length,
+            classes,
+          },
+          null,
+          2
+        )
+      );
+
+      const blob = await zip.generateAsync({ type: "blob" });
+      saveAs(blob, `${safeRoot}-${Date.now().toString().slice(-6)}.zip`);
+    }
+  );
 }
 
 /**
@@ -329,50 +343,61 @@ export function parseImportedDatasetJson(jsonText: string): {
  * - inference-example.js (sample code showing how to load and run the model)
  */
 export async function exportTrainedModelZip(record: TrainedModelRecord) {
-  if (!record.serializedModel) {
-    throw new Error("No serialized TensorFlow.js weights available for export.");
-  }
-
-  const zip = new JSZip();
-  const { modelTopology, weightSpecs, weightDataBase64 } =
-    record.serializedModel;
-
-  const modelJson = {
-    format: "layers-model",
-    generatedBy: "Hand Pose Studio v2.0",
-    convertedBy: null,
-    modelTopology,
-    weightsManifest: [
-      {
-        paths: ["model.weights.bin"],
-        weights: weightSpecs,
+  return await Sentry.startSpan(
+    {
+      name: "export_trained_model_zip",
+      op: "model.export",
+      attributes: {
+        model_id: record.id,
+        classes_count: record.classes.length,
+        final_accuracy: record.finalAccuracy,
       },
-    ],
-  };
+    },
+    async () => {
+      if (!record.serializedModel) {
+        throw new Error("No serialized TensorFlow.js weights available for export.");
+      }
 
-  const weightBytes = base64ToUint8Array(weightDataBase64);
+      const zip = new JSZip();
+      const { modelTopology, weightSpecs, weightDataBase64 } =
+        record.serializedModel;
 
-  zip.file("model.json", JSON.stringify(modelJson, null, 2));
-  zip.file("model.weights.bin", weightBytes);
-  zip.file(
-    "classes.json",
-    JSON.stringify(
-      {
-        id: record.id,
-        name: record.name,
-        classes: record.classes,
-        finalAccuracy: record.finalAccuracy,
-        trainedAt: new Date(record.trainedAt).toISOString(),
-        inputShape: [1, FEATURE_VECTOR_SIZE],
-        preprocessing:
-          "Normalized 131-D feature vector: Hand 1 (63), Hand 2 (63), relative wrist offset (3), presence flags (2). Supports both 1-hand and 2-hand gestures.",
-      },
-      null,
-      2
-    )
-  );
+      const modelJson = {
+        format: "layers-model",
+        generatedBy: "Hand Pose Studio v2.0",
+        convertedBy: null,
+        modelTopology,
+        weightsManifest: [
+          {
+            paths: ["model.weights.bin"],
+            weights: weightSpecs,
+          },
+        ],
+      };
 
-  const exampleCode = `// Example: Loading and running your Hand Pose Studio TF.js model
+      const weightBytes = base64ToUint8Array(weightDataBase64);
+
+      zip.file("model.json", JSON.stringify(modelJson, null, 2));
+      zip.file("model.weights.bin", weightBytes);
+      zip.file(
+        "classes.json",
+        JSON.stringify(
+          {
+            id: record.id,
+            name: record.name,
+            classes: record.classes,
+            finalAccuracy: record.finalAccuracy,
+            trainedAt: new Date(record.trainedAt).toISOString(),
+            inputShape: [1, FEATURE_VECTOR_SIZE],
+            preprocessing:
+              "Normalized 131-D feature vector: Hand 1 (63), Hand 2 (63), relative wrist offset (3), presence flags (2). Supports both 1-hand and 2-hand gestures.",
+          },
+          null,
+          2
+        )
+      );
+
+      const exampleCode = `// Example: Loading and running your Hand Pose Studio TF.js model
 import * as tf from '@tensorflow/tfjs';
 
 const CLASSES = ${JSON.stringify(record.classes)};
@@ -443,10 +468,12 @@ export function predictPose(model, detectedHands) {
 }
 `;
 
-  zip.file("inference-example.js", exampleCode);
+      zip.file("inference-example.js", exampleCode);
 
-  const blob = await zip.generateAsync({ type: "blob" });
-  const safeName =
-    record.name.trim().replace(/[^a-zA-Z0-9_-]/g, "-") || "handpose-tfjs-model";
-  saveAs(blob, `${safeName}.zip`);
+      const blob = await zip.generateAsync({ type: "blob" });
+      const safeName =
+        record.name.trim().replace(/[^a-zA-Z0-9_-]/g, "-") || "handpose-tfjs-model";
+      saveAs(blob, `${safeName}.zip`);
+    }
+  );
 }
