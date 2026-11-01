@@ -80,8 +80,15 @@ export function prepareTrainingDataset(
 
     if (shouldHoldout && classSamples.length >= 4) {
       const valCount = Math.max(1, Math.floor(classSamples.length * 0.15));
-      trainClassSamples = classSamples.slice(0, classSamples.length - valCount);
-      valClassSamples = classSamples.slice(classSamples.length - valCount);
+      const stride = classSamples.length / valCount;
+      const valIndices = new Set<number>();
+      for (let v = 0; v < valCount; v++) {
+        valIndices.add(
+          Math.min(classSamples.length - 1, Math.floor((v + 0.5) * stride))
+        );
+      }
+      trainClassSamples = classSamples.filter((_, idx) => !valIndices.has(idx));
+      valClassSamples = classSamples.filter((_, idx) => valIndices.has(idx));
     }
 
     // Process training samples (with augmentation if enabled)
@@ -137,7 +144,7 @@ function shuffleDataset(features: number[][], labels: number[]) {
 
 /**
  * Ensures TensorFlow.js is initialized with the optimal backend.
- * For lightweight tabular MLPs (63 input dimensions, ~6k parameters),
+ * For lightweight tabular MLPs (131 input dimensions, ~10k parameters),
  * the CPU backend executes in < 0.6s for 40 epochs with ZERO WebGL shader compilation delay.
  * The WebGL backend incurs 1-2s of main-thread freeze during epoch 1 while compiling GLSL
  * shaders, and introduces GPU context contention with MediaPipe.
@@ -157,22 +164,13 @@ export async function ensureTFBackend(): Promise<string> {
 
   if (typeof window !== "undefined") {
     Sentry.setTag("tf_backend", backend);
-    Sentry.setContext("hardware_profile", {
-      cores: typeof navigator !== "undefined" ? navigator.hardwareConcurrency || "unknown" : "unknown",
-      webgl_supported: typeof window !== "undefined" ? Boolean(window.WebGLRenderingContext) : false,
-      webgl2_supported: typeof window !== "undefined" ? Boolean(window.WebGL2RenderingContext) : false,
-      device_memory:
-        typeof navigator !== "undefined" && "deviceMemory" in navigator
-          ? (navigator as unknown as { deviceMemory: number }).deviceMemory
-          : "unknown",
-    });
   }
 
   return backend;
 }
 
 /**
- * Trains a TensorFlow.js Multi-Layer Perceptron (MLP) on 63-D normalized hand landmark vectors.
+ * Trains a TensorFlow.js Multi-Layer Perceptron (MLP) on 131-D normalized hand landmark vectors.
  */
 export async function trainMLPClassifier(
   samples: CapturedSample[],

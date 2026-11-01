@@ -1,15 +1,13 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import * as tf from "@tensorflow/tfjs";
+import dynamic from "next/dynamic";
+import type * as tf from "@tensorflow/tfjs";
 import * as Sentry from "@sentry/nextjs";
 import Navbar from "@/components/Navbar";
 import CameraStage from "@/components/CameraStage";
 import ClassManager from "@/components/ClassManager";
-import TrainerPanel from "@/components/TrainerPanel";
-import DatasetHubModal from "@/components/DatasetHubModal";
-import TutorialModal from "@/components/TutorialModal";
-import KofiModal from "@/components/KofiModal";
+import ConfirmDialog from "@/components/ConfirmDialog";
 import {
   CapturedSample,
   DetectedHand,
@@ -19,7 +17,11 @@ import {
   TrainingConfig,
   TrainingHistoryPoint,
 } from "@/types/handpose";
-import { extractFeatureVector, getClassColor } from "@/lib/landmarks";
+import {
+  CLASS_COLORS,
+  extractFeatureVector,
+  getClassColor,
+} from "@/lib/landmarks";
 import {
   deserializeTFModel,
   ensureTFBackend,
@@ -43,11 +45,25 @@ import {
   BookOpen,
   BrainCircuit,
   CameraOff,
+  CheckCircle2,
   FolderPlus,
   Layers,
   Sparkles,
   X,
 } from "lucide-react";
+
+const TrainerPanel = dynamic(() => import("@/components/TrainerPanel"), {
+  ssr: false,
+});
+const DatasetHubModal = dynamic(() => import("@/components/DatasetHubModal"), {
+  ssr: false,
+});
+const TutorialModal = dynamic(() => import("@/components/TutorialModal"), {
+  ssr: false,
+});
+const KofiModal = dynamic(() => import("@/components/KofiModal"), {
+  ssr: false,
+});
 
 const INITIAL_CLASSES: PoseClassMeta[] = [
   { name: "Thumbs Up", color: getClassColor(0), createdAt: 1 },
@@ -69,6 +85,7 @@ export default function HandPoseStudioPage() {
   // MediaPipe & Telemetry State
   const [modelReady, setModelReady] = useState(false);
   const [fps, setFps] = useState(0);
+  const [isBursting, setIsBursting] = useState(false);
   const lastFpsUpdateRef = useRef<number>(0);
   const lastPredictionTimeRef = useRef<number>(0);
   const [syncStatus, setSyncStatus] = useState<
@@ -94,23 +111,56 @@ export default function HandPoseStudioPage() {
   const [livePrediction, setLivePrediction] =
     useState<PredictionResult | null>(null);
 
-  // Modals & Help
+  // Modals, Confirm Dialog & Non-blocking Toast Banner
   const [hubOpen, setHubOpen] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const [kofiOpen, setKofiOpen] = useState(false);
-  const [samplePreviewOpen, setSamplePreviewOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(true);
   const [hydrated, setHydrated] = useState(false);
 
-  const isAnyModalOpen = hubOpen || tutorialOpen || kofiOpen || samplePreviewOpen;
+  const [toastNotice, setToastNotice] = useState<{
+    type: "success" | "error" | "info";
+    text: string;
+  } | null>(null);
+
+  const [confirmState, setConfirmState] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    variant: "danger" | "warning" | "primary";
+    onConfirm: () => void;
+  } | null>(null);
+
+  const collectTabRef = useRef<HTMLButtonElement | null>(null);
+  const trainTabRef = useRef<HTMLButtonElement | null>(null);
+
+  const showToast = useCallback(
+    (text: string, type: "success" | "error" | "info" = "info") => {
+      setToastNotice({ type, text });
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!toastNotice) return;
+    const t = setTimeout(() => setToastNotice(null), 4000);
+    return () => clearTimeout(t);
+  }, [toastNotice]);
+
+  // Only pause hardware webcam stream when a full-screen workflow modal is open (not during quick sample thumbnail inspection)
+  const isFullModalOpen = hubOpen || tutorialOpen || kofiOpen;
+
+  // Warm up TF.js backend lazily when user opens Step 2
+  useEffect(() => {
+    if (activeStepTab === "train" || activeStepTab === "all") {
+      ensureTFBackend().catch(() => {});
+    }
+  }, [activeStepTab]);
 
   // Load persisted workspace & preferences from browser storage on mount
   useEffect(() => {
     let mounted = true;
     async function hydrate() {
-      // Warm up TF.js CPU backend in background on mount
-      ensureTFBackend().catch(() => {});
-
       const prefs = loadPreferencesFromLocalStorage();
       if (!prefs.hasCompletedTutorial) {
         setTutorialOpen(true);
@@ -120,9 +170,9 @@ export default function HandPoseStudioPage() {
       const saved = await loadWorkspaceLocally();
       if (!mounted) return;
 
-      if (saved && (saved.classes.length > 0 || saved.samples.length > 0)) {
+      if (saved && Array.isArray(saved.classes)) {
         setClasses(saved.classes);
-        setSamples(saved.samples);
+        setSamples(saved.samples || []);
         setActiveClassName(saved.classes[0]?.name || null);
 
         if (saved.activeModel) {
@@ -136,7 +186,11 @@ export default function HandPoseStudioPage() {
               const restored = await deserializeTFModel(
                 saved.activeModel.serializedModel
               );
-              if (mounted) tfModelRef.current = restored;
+              if (mounted) {
+                tfModelRef.current = restored;
+              } else {
+                restored.dispose();
+              }
             } catch (err) {
               console.warn(
                 "Could not restore TF.js model from local storage:",
@@ -160,9 +214,9 @@ export default function HandPoseStudioPage() {
   const maxWaitTimerRef = useRef<NodeJS.Timeout | null>(null);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Auto-save workspace with debounce (350ms) and max-wait (1200ms) to prevent starvation during bursts
+  // Auto-save workspace with debounce (350ms), deferring writes during active Auto-Burst or MLP training
   useEffect(() => {
-    if (!hydrated) return;
+    if (!hydrated || isBursting || isTraining) return;
     setSyncStatus("saving");
 
     const flushSave = async () => {
@@ -174,7 +228,11 @@ export default function HandPoseStudioPage() {
         clearTimeout(maxWaitTimerRef.current);
         maxWaitTimerRef.current = null;
       }
-      const { classes: c, samples: s, trainedModelRecord: m } = latestStateRef.current;
+      const {
+        classes: c,
+        samples: s,
+        trainedModelRecord: m,
+      } = latestStateRef.current;
       try {
         await saveWorkspaceLocally(c, s, m);
         setSyncStatus("saved");
@@ -184,16 +242,14 @@ export default function HandPoseStudioPage() {
       }
     };
 
-    // Schedule max-wait timer if not already active
     if (!maxWaitTimerRef.current) {
-      maxWaitTimerRef.current = setTimeout(flushSave, 1200);
+      maxWaitTimerRef.current = setTimeout(flushSave, 1500);
     }
 
-    // Reset trailing debounce timer
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
     }
-    debounceTimerRef.current = setTimeout(flushSave, 350);
+    debounceTimerRef.current = setTimeout(flushSave, 400);
 
     return () => {
       if (debounceTimerRef.current) {
@@ -201,7 +257,7 @@ export default function HandPoseStudioPage() {
         debounceTimerRef.current = null;
       }
     };
-  }, [classes, samples, trainedModelRecord, hydrated]);
+  }, [classes, samples, trainedModelRecord, hydrated, isBursting, isTraining]);
 
   // Clean up any lingering timers and TF.js model on unmount
   useEffect(() => {
@@ -230,14 +286,20 @@ export default function HandPoseStudioPage() {
       setActiveClassName(existing.name);
       return;
     }
-    setClasses((prev) => [
-      ...prev,
-      {
-        name: trimmed,
-        color: getClassColor(prev.length),
-        createdAt: Date.now(),
-      },
-    ]);
+    setClasses((prev) => {
+      const usedColors = new Set(prev.map((c) => c.color));
+      const unusedColor =
+        CLASS_COLORS.find((color) => !usedColors.has(color)) ||
+        getClassColor(prev.length);
+      return [
+        ...prev,
+        {
+          name: trimmed,
+          color: unusedColor,
+          createdAt: Date.now(),
+        },
+      ];
+    });
     setActiveClassName(trimmed);
   }, []);
 
@@ -251,66 +313,97 @@ export default function HandPoseStudioPage() {
     }
   }, []);
 
-  const handleRenameClass = useCallback((oldName: string, newName: string) => {
-    const trimmed = newName.trim();
-    if (!trimmed || trimmed === oldName) return;
+  const handleRenameClass = useCallback(
+    (oldName: string, newName: string) => {
+      const trimmed = newName.trim();
+      if (!trimmed || trimmed === oldName) return;
 
-    const currentClasses = latestStateRef.current.classes;
-    const exists = currentClasses.some(
-      (c) =>
-        c.name.toLowerCase() === trimmed.toLowerCase() &&
-        c.name.toLowerCase() !== oldName.toLowerCase()
-    );
-    if (exists) {
-      alert(`A class named "${trimmed}" already exists.`);
-      return;
-    }
+      const currentClasses = latestStateRef.current.classes;
+      const exists = currentClasses.some(
+        (c) =>
+          c.name.toLowerCase() === trimmed.toLowerCase() &&
+          c.name.toLowerCase() !== oldName.toLowerCase()
+      );
+      if (exists) {
+        showToast(`A class named "${trimmed}" already exists.`, "error");
+        return;
+      }
 
-    setClasses((prev) =>
-      prev.map((c) => (c.name === oldName ? { ...c, name: trimmed } : c))
-    );
+      setClasses((prev) =>
+        prev.map((c) => (c.name === oldName ? { ...c, name: trimmed } : c))
+      );
 
-    setSamples((prev) =>
-      prev.map((s) =>
-        s.className === oldName ? { ...s, className: trimmed } : s
-      )
-    );
+      setSamples((prev) =>
+        prev.map((s) =>
+          s.className === oldName ? { ...s, className: trimmed } : s
+        )
+      );
 
-    setActiveClassName((prev) => (prev === oldName ? trimmed : prev));
+      setActiveClassName((prev) => (prev === oldName ? trimmed : prev));
 
-    // Keep active model class labels & exemplars in sync if model was trained on old name
-    setTrainedModelRecord((prev) => {
-      if (!prev || !prev.classes.includes(oldName)) return prev;
-      return {
-        ...prev,
-        classes: prev.classes.map((cls) => (cls === oldName ? trimmed : cls)),
-        knnExemplars: prev.knnExemplars?.map((ex) =>
-          ex.className === oldName ? { ...ex, className: trimmed } : ex
-        ),
-      };
-    });
-  }, []);
+      // Keep active model class labels & exemplars in sync if model was trained on old name
+      setTrainedModelRecord((prev) => {
+        if (!prev || !prev.classes.includes(oldName)) return prev;
+        return {
+          ...prev,
+          classes: prev.classes.map((cls) =>
+            cls === oldName ? trimmed : cls
+          ),
+          knnExemplars: prev.knnExemplars?.map((ex) =>
+            ex.className === oldName ? { ...ex, className: trimmed } : ex
+          ),
+        };
+      });
+    },
+    [showToast]
+  );
 
-  const handleDeleteClass = useCallback((name: string) => {
-    const { samples: currentSamples, classes: currentClasses, trainedModelRecord: currentModel } = latestStateRef.current;
-    const sampleCount = currentSamples.filter((s) => s.className === name).length;
-    const confirmMessage =
-      sampleCount > 0
-        ? `Delete class "${name}" and its ${sampleCount} captured ${sampleCount === 1 ? "sample" : "samples"}? This cannot be undone.`
-        : `Delete class "${name}"?`;
-    if (typeof window !== "undefined" && !window.confirm(confirmMessage)) {
-      return;
-    }
+  const executeDeleteClass = useCallback(
+    (name: string) => {
+      const {
+        classes: currentClasses,
+        trainedModelRecord: currentModel,
+      } = latestStateRef.current;
+      const nextClasses = currentClasses.filter((c) => c.name !== name);
+      setSamples((prev) => prev.filter((s) => s.className !== name));
+      setClasses(nextClasses);
+      setActiveClassName((curr) =>
+        curr === name ? nextClasses[0]?.name || null : curr
+      );
 
-    const nextClasses = currentClasses.filter((c) => c.name !== name);
-    setSamples((prev) => prev.filter((s) => s.className !== name));
-    setClasses(nextClasses);
-    setActiveClassName((curr) => (curr === name ? nextClasses[0]?.name || null : curr));
+      if (currentModel?.classes.includes(name)) {
+        clearActiveModel();
+      }
+      showToast(`Deleted class "${name}".`, "info");
+    },
+    [clearActiveModel, showToast]
+  );
 
-    if (currentModel?.classes.includes(name)) {
-      clearActiveModel();
-    }
-  }, [clearActiveModel]);
+  const handleDeleteClass = useCallback(
+    (name: string) => {
+      const { samples: currentSamples } = latestStateRef.current;
+      const sampleCount = currentSamples.filter(
+        (s) => s.className === name
+      ).length;
+
+      setConfirmState({
+        title: `Delete "${name}"?`,
+        description:
+          sampleCount > 0
+            ? `This will permanently delete the "${name}" class and its ${sampleCount} captured ${
+                sampleCount === 1 ? "sample" : "samples"
+              }. This cannot be undone.`
+            : `Are you sure you want to delete the "${name}" pose class?`,
+        confirmLabel: "Delete Class",
+        variant: "danger",
+        onConfirm: () => {
+          setConfirmState(null);
+          executeDeleteClass(name);
+        },
+      });
+    },
+    [executeDeleteClass]
+  );
 
   const handleCaptureSample = useCallback((sample: CapturedSample) => {
     setSamples((prev) => [...prev, sample]);
@@ -322,23 +415,55 @@ export default function HandPoseStudioPage() {
 
   const handleClearWorkspace = useCallback(() => {
     const currentSamples = latestStateRef.current.samples;
-    if (currentSamples.length > 0) {
-      const message = `Are you sure you want to reset the workspace? All ${currentSamples.length} captured ${currentSamples.length === 1 ? "sample" : "samples"} and the active model will be cleared. This cannot be undone.`;
-      if (typeof window !== "undefined" && !window.confirm(message)) {
-        return;
-      }
-    }
-    clearActiveModel();
-    setSamples([]);
-  }, [clearActiveModel]);
+    if (currentSamples.length === 0) return;
 
-  const handleLoadDemoDataset = useCallback(() => {
+    setConfirmState({
+      title: "Clear All Captured Samples?",
+      description: `This will remove all ${currentSamples.length} captured ${
+        currentSamples.length === 1 ? "sample" : "samples"
+      } and reset the active model. Your pose class names will be kept. This cannot be undone.`,
+      confirmLabel: "Clear All Samples",
+      variant: "danger",
+      onConfirm: () => {
+        setConfirmState(null);
+        clearActiveModel();
+        setSamples([]);
+        showToast("Cleared all captured samples.", "info");
+      },
+    });
+  }, [clearActiveModel, showToast]);
+
+  const executeLoadDemoDataset = useCallback(() => {
     clearActiveModel();
     const demo = generateDemoDataset(8);
     setClasses(demo.classes);
     setSamples(demo.samples);
     setActiveClassName(demo.classes[0].name);
-  }, [clearActiveModel]);
+    showToast(
+      "Loaded 32 synthetic 3D hand pose samples across 4 classes!",
+      "success"
+    );
+  }, [clearActiveModel, showToast]);
+
+  const handleLoadDemoDataset = useCallback(() => {
+    const currentSamples = latestStateRef.current.samples;
+    if (currentSamples.length > 0) {
+      setConfirmState({
+        title: "Replace Current Samples with Demo Data?",
+        description: `Loading the 32-sample Demo Dataset will replace your ${currentSamples.length} currently captured ${
+          currentSamples.length === 1 ? "sample" : "samples"
+        }. You can save a snapshot in 'Export & Backups' first if you want to keep your current work.`,
+        confirmLabel: "Load Demo Dataset",
+        variant: "warning",
+        onConfirm: () => {
+          setConfirmState(null);
+          executeLoadDemoDataset();
+        },
+      });
+      return;
+    }
+    executeLoadDemoDataset();
+  }, [executeLoadDemoDataset]);
 
   // Memoize extracted feature vectors for all samples in the workspace
   // so k-NN does not re-extract features on every video frame
@@ -357,7 +482,7 @@ export default function HandPoseStudioPage() {
   const handleHandsDetected = useCallback(
     (detectedHands: DetectedHand[], currentFps: number) => {
       const now = performance.now();
-      if (now - lastFpsUpdateRef.current >= 800) {
+      if (currentFps === 0 || now - lastFpsUpdateRef.current >= 800) {
         lastFpsUpdateRef.current = now;
         setFps(currentFps);
       }
@@ -372,7 +497,19 @@ export default function HandPoseStudioPage() {
       }
       lastPredictionTimeRef.current = now;
 
+      // Respect the currently selected classifier engine first so switching between MLP and k-NN is immediate
       if (
+        trainingConfig.classifierType === "knn" &&
+        workspaceExemplars.length >= 2
+      ) {
+        const pred = predictWithKNN(
+          workspaceExemplars,
+          detectedHands,
+          classes,
+          5
+        );
+        setLivePrediction(pred);
+      } else if (
         trainedModelRecord?.classifierType === "mlp" &&
         tfModelRef.current
       ) {
@@ -385,36 +522,57 @@ export default function HandPoseStudioPage() {
         setLivePrediction(pred);
       } else if (
         trainedModelRecord?.classifierType === "knn" &&
-        trainedModelRecord.knnExemplars &&
-        trainedModelRecord.knnExemplars.length >= 2
+        workspaceExemplars.length >= 2
       ) {
         const pred = predictWithKNN(
-          trainedModelRecord.knnExemplars,
+          workspaceExemplars,
           detectedHands,
           classes,
           5
         );
         setLivePrediction(pred);
-      } else if (
-        (trainedModelRecord?.classifierType === "knn" ||
-          trainingConfig.classifierType === "knn") &&
-        workspaceExemplars.length >= 2
-      ) {
-        // Keep k-NN active live with latest workspace exemplars
-        const pred = predictWithKNN(workspaceExemplars, detectedHands, classes, 5);
-        setLivePrediction(pred);
       } else {
         setLivePrediction(null);
       }
     },
-    [trainedModelRecord, trainingConfig.classifierType, workspaceExemplars, classes]
+    [
+      trainedModelRecord,
+      trainingConfig.classifierType,
+      workspaceExemplars,
+      classes,
+    ]
   );
 
-  const handleExportModelZip = useCallback(() => {
-    if (trainedModelRecord) {
-      exportTrainedModelZip(trainedModelRecord);
+  const handleExportModelZip = useCallback(async () => {
+    if (!trainedModelRecord) return;
+    try {
+      await exportTrainedModelZip(trainedModelRecord);
+      showToast(
+        `Exported "${trainedModelRecord.name}" bundle (.zip).`,
+        "success"
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : "Failed to export model.",
+        "error"
+      );
     }
-  }, [trainedModelRecord]);
+  }, [trainedModelRecord, showToast]);
+
+  const handleQuickDownloadZip = useCallback(async () => {
+    try {
+      await exportDatasetZip(classes, samples, "handpose-dataset");
+      showToast(
+        `Exported ${samples.length} samples across ${classes.length} classes (.zip).`,
+        "success"
+      );
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : "Failed to export dataset ZIP.",
+        "error"
+      );
+    }
+  }, [classes, samples, showToast]);
 
   const handleSaveModelLocally = useCallback(async () => {
     if (trainedModelRecord) {
@@ -449,6 +607,10 @@ export default function HandPoseStudioPage() {
         knnExemplars: workspaceExemplars,
       };
       setTrainedModelRecord(record);
+      showToast(
+        `k-NN Leave-One-Out accuracy evaluated: ${evalResult.accuracy}% across ${evalResult.classes.length} classes.`,
+        "success"
+      );
       return;
     }
 
@@ -473,13 +635,14 @@ export default function HandPoseStudioPage() {
       tfModelRef.current = result.model;
 
       const lastPt = result.history[result.history.length - 1];
+      const finalAcc = lastPt?.valAccuracy ?? lastPt?.accuracy ?? 100;
       const record: TrainedModelRecord = {
         id: `mlp_${Date.now()}`,
         name: `TF.js MLP (${result.classes.length} classes)`,
         classifierType: "mlp",
         classes: result.classes,
         sampleCount: samples.length,
-        finalAccuracy: lastPt?.accuracy ?? 100,
+        finalAccuracy: finalAcc,
         finalLoss: lastPt?.loss ?? 0,
         epochs: trainingConfig.epochs,
         trainedAt: Date.now(),
@@ -488,10 +651,15 @@ export default function HandPoseStudioPage() {
       };
 
       setTrainedModelRecord(record);
+      showToast(
+        `Trained TF.js Neural Network (${finalAcc}% accuracy across ${result.classes.length} classes)!`,
+        "success"
+      );
     } catch (err) {
       console.error("Training error:", err);
-      alert(
-        err instanceof Error ? err.message : "Failed to train neural network"
+      showToast(
+        err instanceof Error ? err.message : "Failed to train neural network",
+        "error"
       );
     } finally {
       setIsTraining(false);
@@ -518,11 +686,19 @@ export default function HandPoseStudioPage() {
         console.error("Failed to deserialize model:", err);
       }
     }
+    showToast(`Activated model "${model.name}".`, "success");
   };
 
   const handleToggleQuickGuide = () => {
     setShowHelp((prev) => {
       const next = !prev;
+      if (typeof document !== "undefined") {
+        if (!next) {
+          document.documentElement.dataset.hideGuide = "true";
+        } else {
+          delete document.documentElement.dataset.hideGuide;
+        }
+      }
       savePreferencesToLocalStorage({ hideQuickGuide: !next });
       return next;
     });
@@ -530,7 +706,27 @@ export default function HandPoseStudioPage() {
 
   const handleCloseTutorial = () => {
     setTutorialOpen(false);
-    savePreferencesToLocalStorage({ hasCompletedTutorial: true });
+    setShowHelp(false);
+    if (typeof document !== "undefined") {
+      document.documentElement.dataset.hideGuide = "true";
+    }
+    savePreferencesToLocalStorage({
+      hasCompletedTutorial: true,
+      hideQuickGuide: true,
+    });
+  };
+
+  const handleStepTabKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      if (activeStepTab === "collect") {
+        setActiveStepTab("train");
+        trainTabRef.current?.focus();
+      } else {
+        setActiveStepTab("collect");
+        collectTabRef.current?.focus();
+      }
+    }
   };
 
   // Count how many classes have at least 1 sample
@@ -547,74 +743,118 @@ export default function HandPoseStudioPage() {
         trainedAccuracy={trainedModelRecord?.finalAccuracy}
         syncStatus={syncStatus}
         onOpenHub={() => setHubOpen(true)}
-        onQuickDownloadZip={() =>
-          exportDatasetZip(classes, samples, "handpose-dataset")
-        }
+        onQuickDownloadZip={handleQuickDownloadZip}
         onLoadDemoData={handleLoadDemoDataset}
         onOpenTutorial={() => setTutorialOpen(true)}
         onToggleHelp={handleToggleQuickGuide}
         onOpenKofi={() => setKofiOpen(true)}
       />
 
-      {/* Quick Studio Guide Banner (Strictly stacked vertically with clear step badges) */}
+      {/* Non-blocking Toast Notification Banner */}
+      {toastNotice && (
+        <div
+          role={toastNotice.type === "error" ? "alert" : "status"}
+          aria-live="polite"
+          className="fixed bottom-4 right-4 z-50 flex max-w-md items-center gap-2.5 rounded-xl border px-4 py-3 text-xs font-semibold shadow-2xl backdrop-blur-md animate-in fade-in slide-in-from-bottom-2 duration-150"
+          style={{
+            backgroundColor:
+              toastNotice.type === "error"
+                ? "rgba(69, 10, 10, 0.95)"
+                : toastNotice.type === "success"
+                ? "rgba(6, 46, 34, 0.95)"
+                : "rgba(14, 33, 53, 0.95)",
+            borderColor:
+              toastNotice.type === "error"
+                ? "rgba(244, 63, 94, 0.5)"
+                : toastNotice.type === "success"
+                ? "rgba(16, 185, 129, 0.5)"
+                : "rgba(56, 189, 248, 0.4)",
+          }}
+        >
+          {toastNotice.type === "error" ? (
+            <AlertTriangle
+              className="h-4 w-4 shrink-0 text-rose-400"
+              aria-hidden="true"
+            />
+          ) : (
+            <CheckCircle2
+              className="h-4 w-4 shrink-0 text-emerald-400"
+              aria-hidden="true"
+            />
+          )}
+          <span className="text-slate-100">{toastNotice.text}</span>
+          <button
+            type="button"
+            onClick={() => setToastNotice(null)}
+            aria-label="Dismiss notification"
+            className="ml-1 rounded p-1 text-slate-300 hover:text-white"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      {/* Quick Studio Guide Banner (Aligned with Step 1, Step 2, and Export) */}
       {showHelp && (
-        <div className="border-b border-ocean-700/60 bg-gradient-to-r from-[#102337]/95 via-[#132d47]/95 to-[#102337]/95 px-3.5 py-3 sm:px-6 shadow-sm">
+        <div
+          id="quick-studio-guide"
+          className="border-b border-ocean-700/60 bg-gradient-to-r from-[#102337]/95 via-[#132d47]/95 to-[#102337]/95 px-3.5 py-3 sm:px-6 shadow-sm"
+        >
           <div className="mx-auto flex max-w-[1600px] items-start justify-between gap-3">
-            <div className="flex flex-col gap-2.5 text-xs text-slate-200">
+            <div className="flex flex-col gap-2 text-xs text-slate-200">
               <div className="flex items-center gap-2 font-bold text-[#FFE79C] text-sm">
-                <BookOpen className="h-4 w-4 shrink-0 text-terracotta-400" />
+                <BookOpen
+                  className="h-4 w-4 shrink-0 text-terracotta-400"
+                  aria-hidden="true"
+                />
                 <span>Quick Studio Guide:</span>
               </div>
-              <div className="flex flex-col space-y-2 text-slate-200">
-                <div className="flex items-start gap-2.5">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-ocean-600 text-[10px] font-bold text-white shadow-sm mt-0.5">
-                    1
+              <div className="grid grid-cols-1 gap-2.5 md:grid-cols-3 text-slate-200">
+                <div className="flex items-start gap-2 rounded-xl border border-ocean-700/50 bg-[#0b1929]/60 p-2.5">
+                  <span className="shrink-0 rounded-md bg-terracotta-600 px-2 py-0.5 text-xs font-bold text-white shadow-sm">
+                    Step 1
                   </span>
                   <div className="leading-relaxed">
-                    <strong>Select or add a hand pose class</strong> in Step 1 (or click{" "}
-                    <em>Demo Data</em> in the top bar to load 32 ready-made samples).
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-2.5">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-ocean-600 text-[10px] font-bold text-white shadow-sm mt-0.5">
-                    2
-                  </span>
-                  <div className="leading-relaxed">
-                    <strong>Capture photos</strong> by holding your hand in front of the camera and pressing{" "}
-                    <kbd className="rounded border border-ocean-600/60 bg-[#0a1725] px-1.5 py-0.5 font-mono text-[10px] text-slate-200">
+                    <strong>Collect Pose Samples:</strong> Select a class and
+                    press{" "}
+                    <kbd className="rounded border border-ocean-600/60 bg-[#0a1725] px-1.5 py-0.5 font-mono text-xs text-slate-100">
                       Space
                     </kbd>{" "}
-                    or using <strong>Auto-Burst</strong>.
+                    or <strong>Auto-Burst</strong> (or click{" "}
+                    <em>Demo Data</em> to load 32 ready-made poses).
                   </div>
                 </div>
 
-                <div className="flex items-start gap-2.5">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-ocean-600 text-[10px] font-bold text-white shadow-sm mt-0.5">
-                    3
+                <div className="flex items-start gap-2 rounded-xl border border-ocean-700/50 bg-[#0b1929]/60 p-2.5">
+                  <span className="shrink-0 rounded-md bg-ocean-600 px-2 py-0.5 text-xs font-bold text-white shadow-sm">
+                    Step 2
                   </span>
                   <div className="leading-relaxed">
-                    <strong>Train your classifier</strong> in Step 2 to recognize your hand poses live on the webcam feed.
+                    <strong>Train &amp; Test Live:</strong> Train a custom{" "}
+                    <strong>TF.js Neural Network</strong> in ~1 second (or use{" "}
+                    <strong>Instant k-NN</strong>) and test live on your webcam.
                   </div>
                 </div>
 
-                <div className="flex items-start gap-2.5">
-                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-ocean-600 text-[10px] font-bold text-white shadow-sm mt-0.5">
-                    4
+                <div className="flex items-start gap-2 rounded-xl border border-ocean-700/50 bg-[#0b1929]/60 p-2.5">
+                  <span className="shrink-0 rounded-md bg-emerald-600 px-2 py-0.5 text-xs font-bold text-white shadow-sm">
+                    Export
                   </span>
                   <div className="leading-relaxed">
-                    <strong>Download your dataset or model</strong> as a{" "}
-                    <strong>.zip</strong>, <strong>.csv</strong>, or{" "}
-                    <strong>TF.js bundle</strong> (all data is preserved privately in your browser&apos;s local storage).
+                    <strong>100% Local &amp; Portable:</strong> Everything
+                    auto-saves in your browser. Export datasets as{" "}
+                    <strong>.zip</strong> / <strong>.csv</strong> or download
+                    your <strong>TF.js model</strong> anytime.
                   </div>
                 </div>
               </div>
             </div>
             <button
+              type="button"
               onClick={handleToggleQuickGuide}
               title="Dismiss Quick Studio Guide"
               aria-label="Dismiss Quick Studio Guide"
-              className="rounded-lg p-1.5 text-slate-400 hover:bg-[#1a3857] hover:text-white transition"
+              className="flex min-h-[36px] min-w-[36px] items-center justify-center rounded-lg p-1.5 text-slate-300 hover:bg-[#1a3857] hover:text-white transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
             >
               <X className="h-4 w-4" />
             </button>
@@ -632,11 +872,16 @@ export default function HandPoseStudioPage() {
                 <div className="h-10 w-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 mb-3">
                   <CameraOff className="h-5 w-5" />
                 </div>
-                <h3 className="font-semibold text-white mb-1">Camera Stage Error</h3>
-                <p className="text-xs text-slate-400 max-w-sm mb-4">
-                  {error instanceof Error ? error.message : "An unexpected camera stage error occurred."}
+                <h3 className="font-semibold text-white mb-1">
+                  Camera Stage Error
+                </h3>
+                <p className="text-xs text-slate-300 max-w-sm mb-4">
+                  {error instanceof Error
+                    ? error.message
+                    : "An unexpected camera stage error occurred."}
                 </p>
                 <button
+                  type="button"
                   onClick={() => resetError()}
                   className="px-4 py-2 rounded-xl bg-ocean-600 hover:bg-ocean-500 text-xs font-medium text-white transition-colors"
                 >
@@ -647,15 +892,19 @@ export default function HandPoseStudioPage() {
           >
             <CameraStage
               activeClass={activeClass}
+              classes={classes}
+              onSelectClass={setActiveClassName}
               onCaptureSample={handleCaptureSample}
               onHandsDetected={handleHandsDetected}
               onModelStatusChange={setModelReady}
+              onBurstStateChange={setIsBursting}
               livePrediction={livePrediction}
               classifierActive={
                 Boolean(trainedModelRecord) ||
-                (trainingConfig.classifierType === "knn" && workspaceExemplars.length >= 2)
+                (trainingConfig.classifierType === "knn" &&
+                  workspaceExemplars.length >= 2)
               }
-              isPaused={isAnyModalOpen}
+              isPaused={isFullModalOpen}
             />
           </Sentry.ErrorBoundary>
 
@@ -663,15 +912,19 @@ export default function HandPoseStudioPage() {
           {samples.length === 0 && (
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-2xl border border-ocean-600/50 bg-[#122840]/75 p-3.5 text-xs shadow-md">
               <div className="flex items-center gap-2.5">
-                <Sparkles className="h-4 w-4 text-gold-300 shrink-0" />
+                <Sparkles
+                  className="h-4 w-4 text-gold-300 shrink-0"
+                  aria-hidden="true"
+                />
                 <span className="text-slate-200">
-                  No webcam handy? Load 32 synthetic 3D hand poses to try
-                  training right away.
+                  No webcam handy? Load 32 synthetic 3D hand poses to test
+                  training and exports right away.
                 </span>
               </div>
               <button
+                type="button"
                 onClick={handleLoadDemoDataset}
-                className="shrink-0 w-full sm:w-auto rounded-lg bg-gradient-to-r from-terracotta-500 to-terracotta-600 px-3.5 py-1.5 font-bold text-white shadow-sm shadow-terracotta-950/40 transition hover:from-terracotta-400 hover:to-terracotta-500"
+                className="min-h-[38px] shrink-0 w-full sm:w-auto rounded-lg bg-gradient-to-r from-terracotta-600 to-terracotta-700 px-3.5 py-1.5 font-bold text-white shadow-sm shadow-terracotta-950/40 transition hover:from-terracotta-500 hover:to-terracotta-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-gold-300"
               >
                 Load Demo Data
               </button>
@@ -683,41 +936,63 @@ export default function HandPoseStudioPage() {
         <div className="flex flex-col gap-4 lg:col-span-7">
           {/* Step Switcher Bar */}
           <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-ocean-700/60 bg-[#0e1d2e]/90 p-2 shadow-lg">
-            <div role="tablist" aria-label="Workflow Steps" className="flex flex-1 items-center gap-1.5">
+            <div
+              role="tablist"
+              aria-label="Workflow Steps"
+              className="flex flex-1 items-center gap-1.5"
+            >
               <button
+                ref={collectTabRef}
+                id="step-tab-collect"
+                type="button"
                 role="tab"
-                aria-selected={activeStepTab === "collect"}
+                aria-selected={
+                  activeStepTab === "collect" || activeStepTab === "all"
+                }
+                aria-controls="step-panel-collect"
+                tabIndex={activeStepTab === "train" ? -1 : 0}
+                onKeyDown={handleStepTabKeyDown}
                 onClick={() => setActiveStepTab("collect")}
                 title={`Step 1: Collect (${samples.length} photos captured)`}
-                className={`flex flex-1 items-center justify-center gap-1.5 sm:gap-2 rounded-xl px-2 sm:px-3.5 py-2 text-[11px] sm:text-xs font-bold transition min-w-0 ${
+                className={`flex min-h-[40px] flex-1 items-center justify-center gap-1.5 sm:gap-2 rounded-xl px-2 sm:px-3.5 py-2 text-xs font-bold transition min-w-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-gold-300 ${
                   activeStepTab === "collect"
-                    ? "bg-gradient-to-r from-terracotta-500 to-terracotta-600 text-white shadow-md shadow-terracotta-950/30"
-                    : "text-slate-300 hover:bg-[#16304d]"
+                    ? "bg-gradient-to-r from-terracotta-600 to-terracotta-700 text-white shadow-md shadow-terracotta-950/30"
+                    : "text-slate-200 hover:bg-[#16304d]"
                 }`}
               >
-                <FolderPlus className="h-4 w-4 shrink-0" />
-                <span className="truncate">Step 1: Collect ({samples.length})</span>
+                <FolderPlus className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span className="truncate">
+                  Step 1: Collect ({samples.length})
+                </span>
               </button>
 
               <button
+                ref={trainTabRef}
+                id="step-tab-train"
+                type="button"
                 role="tab"
-                aria-selected={activeStepTab === "train"}
+                aria-selected={
+                  activeStepTab === "train" || activeStepTab === "all"
+                }
+                aria-controls="step-panel-train"
+                tabIndex={activeStepTab === "train" ? 0 : -1}
+                onKeyDown={handleStepTabKeyDown}
                 onClick={() => setActiveStepTab("train")}
                 title={`Step 2: Train & Test${
                   trainedModelRecord
                     ? ` (${trainedModelRecord.finalAccuracy}% Accuracy)`
                     : ""
                 }`}
-                className={`flex flex-1 items-center justify-center gap-1 sm:gap-2 rounded-xl px-2 sm:px-3.5 py-2 text-[11px] sm:text-xs font-bold transition min-w-0 ${
+                className={`flex min-h-[40px] flex-1 items-center justify-center gap-1 sm:gap-2 rounded-xl px-2 sm:px-3.5 py-2 text-xs font-bold transition min-w-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
                   activeStepTab === "train"
                     ? "bg-ocean-600 text-white shadow-md shadow-ocean-950/30"
-                    : "text-slate-300 hover:bg-[#16304d]"
+                    : "text-slate-200 hover:bg-[#16304d]"
                 }`}
               >
-                <BrainCircuit className="h-4 w-4 shrink-0" />
-                <span className="truncate">Step 2: Train</span>
+                <BrainCircuit className="h-4 w-4 shrink-0" aria-hidden="true" />
+                <span className="truncate">Step 2: Train &amp; Test</span>
                 {trainedModelRecord && (
-                  <span className="rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-mono text-emerald-300 border border-emerald-500/30 shrink-0">
+                  <span className="rounded-full bg-emerald-500/20 px-1.5 py-0.5 text-xs font-mono text-emerald-300 border border-emerald-500/30 shrink-0">
                     {trainedModelRecord.finalAccuracy}%
                   </span>
                 )}
@@ -732,23 +1007,37 @@ export default function HandPoseStudioPage() {
                   prev === "all" ? "collect" : "all"
                 )
               }
-              title="Show both steps stacked together"
-              className={`flex items-center gap-1 rounded-xl border px-3 py-2 text-xs font-medium transition ${
+              title={
+                activeStepTab === "all"
+                  ? "Switch to single-step tabbed view"
+                  : "Stack Step 1 and Step 2 together"
+              }
+              aria-label={
+                activeStepTab === "all"
+                  ? "Switch to single-step tabbed view"
+                  : "Stack Step 1 and Step 2 together"
+              }
+              className={`flex min-h-[40px] items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 ${
                 activeStepTab === "all"
                   ? "border-gold-300/40 bg-gold-200/15 text-gold-200"
-                  : "border-ocean-700/60 bg-[#091522] text-slate-300 hover:text-white"
+                  : "border-ocean-700/60 bg-[#091522] text-slate-200 hover:text-white"
               }`}
             >
-              <Layers className="h-3.5 w-3.5" />
+              <Layers className="h-3.5 w-3.5" aria-hidden="true" />
               <span className="hidden sm:inline">
-                {activeStepTab === "all" ? "Tabbed View" : "Show All"}
+                {activeStepTab === "all" ? "Tabbed View" : "Stack Steps"}
               </span>
             </button>
           </div>
 
           {/* Step 1 Panel: Collect Poses */}
           {(activeStepTab === "collect" || activeStepTab === "all") && (
-            <>
+            <div
+              role="tabpanel"
+              id="step-panel-collect"
+              aria-labelledby="step-tab-collect"
+              className="flex flex-col gap-4"
+            >
               <ClassManager
                 classes={classes}
                 samples={samples}
@@ -760,7 +1049,6 @@ export default function HandPoseStudioPage() {
                 onDeleteSample={handleDeleteSample}
                 onClearAll={handleClearWorkspace}
                 isTraining={isTraining}
-                onPreviewModalChange={setSamplePreviewOpen}
               />
 
               {/* Next Step Callout Banner when user has collected >=2 classes in Tabbed mode */}
@@ -772,86 +1060,115 @@ export default function HandPoseStudioPage() {
                     total photos). Ready to train your hand pose classifier?
                   </span>
                   <button
+                    type="button"
                     onClick={() => setActiveStepTab("train")}
-                    className="flex shrink-0 w-full sm:w-auto items-center justify-center gap-1.5 rounded-xl bg-emerald-500 px-4 py-2 font-bold text-slate-950 transition hover:bg-emerald-400 shadow-md shadow-emerald-950/40"
+                    className="flex min-h-[40px] shrink-0 w-full sm:w-auto items-center justify-center gap-1.5 rounded-xl bg-emerald-500 px-4 py-2 font-bold text-slate-950 transition hover:bg-emerald-400 shadow-md shadow-emerald-950/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
                   >
                     <span>Go to Step 2: Train Model</span>
-                    <ArrowRight className="h-4 w-4" />
+                    <ArrowRight className="h-4 w-4" aria-hidden="true" />
                   </button>
                 </div>
               )}
-            </>
+            </div>
           )}
 
           {/* Step 2 Panel: Train & Test Live */}
           {(activeStepTab === "train" || activeStepTab === "all") && (
-            <Sentry.ErrorBoundary
-              fallback={({ error, resetError }) => (
-                <div className="flex flex-col items-center justify-center p-8 rounded-2xl border border-red-500/30 bg-red-950/20 text-center text-slate-200">
-                  <div className="h-10 w-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 mb-3">
-                    <AlertTriangle className="h-5 w-5" />
-                  </div>
-                  <h3 className="font-semibold text-white mb-1">Trainer Panel Error</h3>
-                  <p className="text-xs text-slate-400 max-w-sm mb-4">
-                    {error instanceof Error ? error.message : "An unexpected trainer panel error occurred."}
-                  </p>
-                  <button
-                    onClick={() => resetError()}
-                    className="px-4 py-2 rounded-xl bg-ocean-600 hover:bg-ocean-500 text-xs font-medium text-white transition-colors"
-                  >
-                    Retry Trainer Panel
-                  </button>
-                </div>
-              )}
+            <div
+              role="tabpanel"
+              id="step-panel-train"
+              aria-labelledby="step-tab-train"
             >
-              <TrainerPanel
-                samples={samples}
-                config={trainingConfig}
-                onChangeConfig={setTrainingConfig}
-                isTraining={isTraining}
-                trainingProgress={trainingProgress}
-                trainedModel={trainedModelRecord}
-                livePrediction={livePrediction}
-                onStartTraining={handleStartTraining}
-                onExportModelZip={handleExportModelZip}
-                onSaveModelLocally={handleSaveModelLocally}
-              />
-            </Sentry.ErrorBoundary>
+              <Sentry.ErrorBoundary
+                fallback={({ error, resetError }) => (
+                  <div className="flex flex-col items-center justify-center p-8 rounded-2xl border border-red-500/30 bg-red-950/20 text-center text-slate-200">
+                    <div className="h-10 w-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 mb-3">
+                      <AlertTriangle className="h-5 w-5" />
+                    </div>
+                    <h3 className="font-semibold text-white mb-1">
+                      Trainer Panel Error
+                    </h3>
+                    <p className="text-xs text-slate-300 max-w-sm mb-4">
+                      {error instanceof Error
+                        ? error.message
+                        : "An unexpected trainer panel error occurred."}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => resetError()}
+                      className="px-4 py-2 rounded-xl bg-ocean-600 hover:bg-ocean-500 text-xs font-medium text-white transition-colors"
+                    >
+                      Retry Trainer Panel
+                    </button>
+                  </div>
+                )}
+              >
+                <TrainerPanel
+                  samples={samples}
+                  config={trainingConfig}
+                  onChangeConfig={setTrainingConfig}
+                  isTraining={isTraining}
+                  trainingProgress={trainingProgress}
+                  trainedModel={trainedModelRecord}
+                  livePrediction={livePrediction}
+                  onStartTraining={handleStartTraining}
+                  onExportModelZip={handleExportModelZip}
+                  onSaveModelLocally={handleSaveModelLocally}
+                />
+              </Sentry.ErrorBoundary>
+            </div>
           )}
         </div>
       </main>
 
       {/* Interactive Onboarding Walkthrough Modal */}
-      <TutorialModal
-        isOpen={tutorialOpen}
-        onClose={handleCloseTutorial}
-        onLoadDemoAndClose={() => {
-          handleLoadDemoDataset();
-          handleCloseTutorial();
-        }}
-      />
+      {tutorialOpen && (
+        <TutorialModal
+          isOpen={tutorialOpen}
+          onClose={handleCloseTutorial}
+          onLoadDemoAndClose={() => {
+            executeLoadDemoDataset();
+            handleCloseTutorial();
+          }}
+        />
+      )}
 
       {/* Datasets, Local Browser Snapshots & Export Hub Modal */}
-      <DatasetHubModal
-        isOpen={hubOpen}
-        onClose={() => setHubOpen(false)}
-        classes={classes}
-        samples={samples}
-        activeModel={trainedModelRecord}
-        onRestoreWorkspace={(newClasses, newSamples) => {
-          clearActiveModel();
-          setClasses(newClasses);
-          setSamples(newSamples);
-          setActiveClassName(newClasses[0]?.name || null);
-        }}
-        onRestoreModel={handleRestoreModel}
-      />
+      {hubOpen && (
+        <DatasetHubModal
+          isOpen={hubOpen}
+          onClose={() => setHubOpen(false)}
+          classes={classes}
+          samples={samples}
+          activeModel={trainedModelRecord}
+          onRestoreWorkspace={(newClasses, newSamples) => {
+            clearActiveModel();
+            setClasses(newClasses);
+            setSamples(newSamples);
+            setActiveClassName(newClasses[0]?.name || null);
+          }}
+          onRestoreModel={handleRestoreModel}
+        />
+      )}
 
       {/* Ko-fi Support & Donation Widget Modal */}
-      <KofiModal
-        isOpen={kofiOpen}
-        onClose={() => setKofiOpen(false)}
-        username="ongyiumark"
+      {kofiOpen && (
+        <KofiModal
+          isOpen={kofiOpen}
+          onClose={() => setKofiOpen(false)}
+          username="ongyiumark"
+        />
+      )}
+
+      {/* Accessible Non-Blocking Confirmation Modal */}
+      <ConfirmDialog
+        isOpen={Boolean(confirmState)}
+        title={confirmState?.title || ""}
+        description={confirmState?.description || ""}
+        confirmLabel={confirmState?.confirmLabel || "Confirm"}
+        variant={confirmState?.variant || "danger"}
+        onConfirm={() => confirmState?.onConfirm()}
+        onCancel={() => setConfirmState(null)}
       />
     </div>
   );

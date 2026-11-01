@@ -4,21 +4,34 @@
 
 import * as Sentry from "@sentry/nextjs";
 
+const SENTRY_DSN =
+  process.env.NEXT_PUBLIC_SENTRY_DSN ||
+  (typeof window !== "undefined" &&
+  window.location.hostname === "handpose.ongyiumark.com"
+    ? "https://1fea65c54eb54e8a3c14bd7ec727030b@o4507947215749120.ingest.de.sentry.io/4512354541109328"
+    : undefined);
+
 Sentry.init({
-  dsn: "https://1fea65c54eb54e8a3c14bd7ec727030b@o4507947215749120.ingest.de.sentry.io/4512354541109328",
+  dsn: SENTRY_DSN,
+  enabled: Boolean(SENTRY_DSN),
+  dataCollection: {
+    userInfo: false,
+    httpBodies: [],
+  },
 
   // Add optional integrations for additional features
   integrations: [
     Sentry.replayIntegration({
-      // Mask text and strictly block camera video/canvas elements to guarantee webcam privacy and low replay overhead
-      maskAllText: false,
-      block: [".sentry-block", "video", "canvas"],
+      // Mask all text and strictly block all camera video/canvas/image elements to guarantee webcam & dataset privacy
+      maskAllText: true,
+      blockAllMedia: true,
+      block: [".sentry-block", "video", "canvas", "img"],
     }),
     Sentry.feedbackIntegration({
-      colorScheme: "system",
-      buttonLabel: "Report Bug",
-      submitButtonLabel: "Submit Feedback",
-      formTitle: "Report a Bug / Feedback",
+      colorScheme: "dark",
+      buttonLabel: "Feedback / Bug",
+      submitButtonLabel: "Send Feedback",
+      formTitle: "Send Anonymous Feedback or Bug Report",
     }),
   ],
 
@@ -36,13 +49,6 @@ Sentry.init({
     "NotAllowedError: Permission denied",
     "AbortError: The play() request was interrupted",
   ],
-
-  dataCollection: {
-    // To disable sending user data and HTTP bodies, uncomment the lines below. For more info visit:
-    // https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/options/#dataCollection
-    // userInfo: false,
-    // httpBodies: [],
-  },
 });
 
 export const onRouterTransitionStart = Sentry.captureRouterTransitionStart;

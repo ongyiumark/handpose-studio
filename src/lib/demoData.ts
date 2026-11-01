@@ -107,6 +107,39 @@ const POSE_TEMPLATES: Record<string, Point3D[]> = {
 };
 
 let sharedThumbnailCanvas: HTMLCanvasElement | null = null;
+let sharedBgCanvas: HTMLCanvasElement | null = null;
+
+function getSharedBgCanvas(): HTMLCanvasElement | null {
+  if (typeof document === "undefined") return null;
+  if (!sharedBgCanvas) {
+    sharedBgCanvas = document.createElement("canvas");
+    sharedBgCanvas.width = 320;
+    sharedBgCanvas.height = 240;
+    const bgCtx = sharedBgCanvas.getContext("2d");
+    if (bgCtx) {
+      const grad = bgCtx.createLinearGradient(0, 0, 320, 240);
+      grad.addColorStop(0, "#0f172a");
+      grad.addColorStop(1, "#1e293b");
+      bgCtx.fillStyle = grad;
+      bgCtx.fillRect(0, 0, 320, 240);
+
+      // Subtle grid lines batched in a single path
+      bgCtx.strokeStyle = "rgba(148, 163, 184, 0.08)";
+      bgCtx.lineWidth = 1;
+      bgCtx.beginPath();
+      for (let x = 40; x < 320; x += 40) {
+        bgCtx.moveTo(x, 0);
+        bgCtx.lineTo(x, 240);
+      }
+      for (let y = 40; y < 240; y += 40) {
+        bgCtx.moveTo(0, y);
+        bgCtx.lineTo(320, y);
+      }
+      bgCtx.stroke();
+    }
+  }
+  return sharedBgCanvas;
+}
 
 function renderSyntheticThumbnail(
   hand: DetectedHand,
@@ -123,37 +156,22 @@ function renderSyntheticThumbnail(
   const ctx = canvas.getContext("2d");
   if (!ctx) return "";
 
-  ctx.clearRect(0, 0, 320, 240);
-  const grad = ctx.createLinearGradient(0, 0, 320, 240);
-  grad.addColorStop(0, "#0f172a");
-  grad.addColorStop(1, "#1e293b");
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, 320, 240);
-
-  // Subtle grid lines
-  ctx.strokeStyle = "rgba(148, 163, 184, 0.08)";
-  ctx.lineWidth = 1;
-  for (let x = 40; x < 320; x += 40) {
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, 240);
-    ctx.stroke();
-  }
-  for (let y = 40; y < 240; y += 40) {
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(320, y);
-    ctx.stroke();
+  const bg = getSharedBgCanvas();
+  if (bg) {
+    ctx.drawImage(bg, 0, 0);
+  } else {
+    ctx.clearRect(0, 0, 320, 240);
   }
 
   drawHandsOnCanvas([hand], ctx, 320, 240, {
     compact: false,
     showLabels: false,
     accentColor,
+    clearCanvas: false,
   });
 
-  ctx.fillStyle = "rgba(15, 23, 42, 0.75)";
-  ctx.fillRect(8, 8, 120, 22);
+  ctx.fillStyle = "rgba(15, 23, 42, 0.78)";
+  ctx.fillRect(8, 8, 126, 22);
   ctx.fillStyle = "#e2e8f0";
   ctx.font = "600 11px Inter, system-ui, sans-serif";
   ctx.fillText(`Demo: ${className}`, 14, 23);

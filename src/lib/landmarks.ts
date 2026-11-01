@@ -78,6 +78,7 @@ export interface DrawHandOptions {
   showLabels?: boolean;
   accentColor?: string;
   mirrored?: boolean;
+  clearCanvas?: boolean;
 }
 
 /**
@@ -91,46 +92,52 @@ export function drawHandsOnCanvas(
   height: number,
   options: DrawHandOptions = {}
 ) {
-  ctx.clearRect(0, 0, width, height);
+  const {
+    compact = false,
+    showLabels = true,
+    accentColor,
+    mirrored = false,
+    clearCanvas = true,
+  } = options;
+
+  if (clearCanvas) {
+    ctx.clearRect(0, 0, width, height);
+  }
   if (!hands || hands.length === 0) return;
 
-  const { compact = false, showLabels = true, accentColor, mirrored = false } = options;
-
-  hands.forEach((hand, handIdx) => {
+  hands.forEach((hand) => {
     const pts = hand.landmarks;
     if (!pts || pts.length < 21) return;
 
     const primaryColor = accentColor || "#38bdf8";
     const jointColor = "#f59e0b";
 
-    const getX = (normX: number) => (mirrored ? (1-normX) * width : normX * width)
+    const getX = (normX: number) => (mirrored ? (1 - normX) * width : normX * width);
 
-    // Draw skeleton connections
+    // Draw skeleton connections in a single batched path to minimize GPU shadow-blur passes
     ctx.save();
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
+    ctx.strokeStyle = primaryColor;
+    ctx.lineWidth = compact ? 1.5 : 3;
+    if (!compact) {
+      ctx.shadowColor = primaryColor;
+      ctx.shadowBlur = 8;
+    }
 
+    ctx.beginPath();
     for (const [startIdx, endIdx] of HAND_CONNECTIONS) {
       const p0 = pts[startIdx];
       const p1 = pts[endIdx];
       if (!p0 || !p1) continue;
 
-      const x0 = getX(p0.x);
-      const y0 = p0.y * height;
-      const x1 = getX(p1.x);
-      const y1 = p1.y * height;
-
-      ctx.beginPath();
-      ctx.moveTo(x0, y0);
-      ctx.lineTo(x1, y1);
-      ctx.strokeStyle = primaryColor;
-      ctx.lineWidth = compact ? 1.5 : 3;
-      if (!compact) {
-        ctx.shadowColor = primaryColor;
-        ctx.shadowBlur = 8;
-      }
-      ctx.stroke();
+      ctx.moveTo(getX(p0.x), p0.y * height);
+      ctx.lineTo(getX(p1.x), p1.y * height);
     }
+    ctx.stroke();
+
+    // Disable shadowBlur before drawing the 21 individual landmark joints
+    ctx.shadowBlur = 0;
 
     // Draw 21 landmark joints
     pts.forEach((pt, idx) => {
